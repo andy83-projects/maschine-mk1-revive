@@ -86,6 +86,9 @@ int main(int argc, char *argv[])
 {
     (void)argc; (void)argv;
 
+    // Force unbuffered stdout so output appears when piped
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     printf("[test] mk1-ipc-test\n");
     printf("[test] connecting to NIHardwareAgent on port '%s'...\n\n",
            NIHA_BOOTSTRAP_PORT);
@@ -99,7 +102,65 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("\n[test] connected — attempting handshake...\n\n");
+    // --- Diagnostic: raw PID Connect probe for multiple device IDs ---
+    // Test whether NIHA responds to ANY device, not just MK1
+    printf("\n[test] === DEVICE PROBE ===\n");
+    printf("[test] sending raw PID Connect for multiple device IDs...\n\n");
+
+    struct { uint16_t id; const char *name; } devices[] = {
+        { 0x1600, "Maschine MK3" },
+        { 0x1610, "Komplete Kontrol MK2" },
+        { 0x1140, "Maschine MK2" },
+        { 0x1300, "Maschine Studio" },
+        { 0x0808, "Maschine MK1" },
+        { 0, NULL }
+    };
+
+    // Get bootstrap port for raw sends
+    CFStringRef bname = CFStringCreateWithCString(NULL, NIHA_BOOTSTRAP_PORT,
+                                                   kCFStringEncodingUTF8);
+    CFMessagePortRef bport = CFMessagePortCreateRemote(NULL, bname);
+    CFRelease(bname);
+
+    for (int i = 0; devices[i].name; i++) {
+        // Build: [0x03447500, device_id, "NiM2", "prmy", 0] (native LE)
+        uint32_t msg[5];
+        msg[0] = 0x03447500;
+        msg[1] = (uint32_t)devices[i].id;
+        msg[2] = 0x4e694d32; // NiM2
+        msg[3] = 0x70726d79; // prmy
+        msg[4] = 0;
+
+        CFDataRef payload = CFDataCreate(NULL, (uint8_t*)msg, 20);
+        CFDataRef reply = NULL;
+
+        SInt32 rc = CFMessagePortSendRequest(bport, 0, payload,
+                                              5.0, 5.0,
+                                              kCFRunLoopDefaultMode,
+                                              &reply);
+        CFRelease(payload);
+
+        CFIndex rlen = reply ? CFDataGetLength(reply) : 0;
+        printf("[test] 0x%04x %-24s → rc=%d reply=%ld bytes",
+               devices[i].id, devices[i].name, (int)rc, (long)rlen);
+
+        if (reply && rlen > 0) {
+            const uint8_t *rb = CFDataGetBytePtr(reply);
+            printf("  [");
+            for (CFIndex j = 0; j < rlen && j < 40; j++)
+                printf("%02x", rb[j]);
+            if (rlen > 40) printf("...");
+            printf("]");
+        }
+        printf("\n");
+        if (reply) CFRelease(reply);
+    }
+    if (bport) CFRelease(bport);
+
+    printf("\n[test] === END PROBE ===\n\n");
+
+    // --- Normal handshake ---
+    printf("[test] attempting MK1 handshake...\n\n");
 
     bool ok = mk1_ipc_handshake(g_conn);
 

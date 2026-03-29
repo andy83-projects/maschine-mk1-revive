@@ -78,13 +78,12 @@ static void log_data(const char *label, const uint8_t *bytes, size_t len)
     if (len > 128) fprintf(stderr, "\n[mk1-ipc]    ... (%zu more)", len - 128);
     fprintf(stderr, "\n");
 
-    // Big-endian uint32 words
+    // Native (little-endian) uint32 words
     if (len >= 4) {
         fprintf(stderr, "[mk1-ipc]   words:");
         for (size_t i = 0; i + 3 < len && i < 64; i += 4) {
             uint32_t w;
             memcpy(&w, bytes + i, 4);
-            w = CFSwapInt32BigToHost(w);
             fprintf(stderr, " 0x%08x", w);
         }
         fprintf(stderr, "\n");
@@ -134,8 +133,9 @@ static void buf_ensure(msg_buf_t *m, size_t need)
 static void buf_push_u32(msg_buf_t *m, uint32_t val)
 {
     buf_ensure(m, 4);
-    uint32_t be = CFSwapInt32HostToBig(val);
-    memcpy(m->buf + m->len, &be, 4);
+    // NI IPC protocol uses native (little-endian) byte order
+    // Confirmed by all three RE projects: Macchina, NIProtocol, Rebellion
+    memcpy(m->buf + m->len, &val, 4);
     m->len += 4;
 }
 
@@ -216,17 +216,20 @@ static bool parse_pid_connect_reply(CFDataRef reply,
         return false;
     }
 
-    // Check for "true" (0x74727565) at offset 0 — as raw bytes, not swapped
-    if (memcmp(p, "true", 4) != 0) {
+    // Check for "true" tag (0x74727565) at offset 0
+    // Stored as native LE: bytes are 65 75 72 74 ("eurt")
+    uint32_t tag;
+    memcpy(&tag, p, 4);
+    if (tag != NI_TAG_TRUE) {
         fprintf(stderr, "[mk1-ipc] reply does not start with 'true' — got: "
-                "%02x %02x %02x %02x\n", p[0], p[1], p[2], p[3]);
+                "0x%08x (%02x %02x %02x %02x)\n",
+                tag, p[0], p[1], p[2], p[3]);
         return false;
     }
 
-    // req_port_name_len at offset 4 (little-endian per Rebellion's sunpack "<i")
+    // req_port_name_len at offset 4 (native little-endian)
     int32_t req_len;
     memcpy(&req_len, p + 4, 4);
-    req_len = (int32_t)CFSwapInt32LittleToHost((uint32_t)req_len);
 
     if (req_len <= 0 || (CFIndex)(8 + req_len) > total) {
         fprintf(stderr, "[mk1-ipc] bad req_port_name_len: %d\n", req_len);
@@ -249,7 +252,6 @@ static bool parse_pid_connect_reply(CFDataRef reply,
 
     int32_t notif_len;
     memcpy(&notif_len, p + offset, 4);
-    notif_len = (int32_t)CFSwapInt32LittleToHost((uint32_t)notif_len);
 
     if (notif_len <= 0 || offset + 4 + notif_len > total) {
         fprintf(stderr, "[mk1-ipc] bad notif_port_name_len: %d\n", notif_len);

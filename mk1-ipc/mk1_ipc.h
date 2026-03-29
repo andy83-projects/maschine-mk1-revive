@@ -22,7 +22,21 @@
 #define NI_MSG_ACK_NOTIF_PORT  0x03404300  // Acknowledge notification port
 #define NI_MSG_DEVSTATE        0x03447143  // Device state query
 
-// Tag constants (4-char codes as big-endian uint32)
+// Event message types (received on notification port from NIHA)
+#define NI_EVT_DEVICE_ON       0x03444e2b  // Device state: ON (includes serial)
+#define NI_EVT_DEVICE_OFF      0x03444e2d  // Device state: OFF
+#define NI_EVT_PAD_DATA        0x03504e00  // Pad pressure data
+#define NI_EVT_BTN_DATA        0x03734e00  // Button state data
+#define NI_EVT_KNOB_ROTATE     0x03654e00  // Knob rotation
+#define NI_EVT_KNOB_4D         0x03774e00  // 4D encoder
+#define NI_EVT_TOUCHSTRIP      0x03744e00  // Touchstrip data
+
+// Output command types (sent to request port toward NIHA)
+#define NI_CMD_LED             0x036c7500  // Set LED state
+#define NI_CMD_DISPLAY         0x03647344  // Display draw
+#define NI_CMD_START           0x03434300  // Start command
+
+// Tag constants (4-char codes stored as native LE uint32)
 #define NI_TAG_NIM2            0x4e694d32  // "NiM2" — Maschine device type
 #define NI_TAG_PRMY            0x70726d79  // "prmy" — primary instance
 #define NI_TAG_TRUE            0x74727565  // "true" — success flag

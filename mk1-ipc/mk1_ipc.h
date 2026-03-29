@@ -1,45 +1,79 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include <CoreFoundation/CoreFoundation.h>
 
-// The Mach port name NIHardwareAgent listens on.
-// Confirmed by SamL98/NIProtocol and biappi/Macchina.
-#define NIHA_PORT_NAME "NIHWMainHandler"
+// ---------------------------------------------------------------------------
+// NI IPC Protocol Constants
+// ---------------------------------------------------------------------------
 
-// Opaque IPC connection handle
+// Bootstrap port — NIHardwareAgent listens here
+#define NIHA_BOOTSTRAP_PORT   "NIHWMainHandler"
+
+// MK1 device ID (USB PID, also used as protocol device identifier)
+#define MK1_DEVICE_ID          0x0808
+
+// Protocol constants (confirmed by terminar/rebellion + biappi/Macchina)
+// Modern NIHA (MK2+): msgid=0, message type in payload first 4 bytes
+#define NI_MSG_VERSION         0x03536756  // GetServiceVersion
+#define NI_MSG_PID_CONNECT     0x03447500  // PID Connect (device-level)
+#define NI_MSG_SERIAL_CONNECT  0x03444900  // Serial Connect (instance-level)
+#define NI_MSG_ACK_NOTIF_PORT  0x03404300  // Acknowledge notification port
+#define NI_MSG_DEVSTATE        0x03447143  // Device state query
+
+// Tag constants (4-char codes as big-endian uint32)
+#define NI_TAG_NIM2            0x4e694d32  // "NiM2" — Maschine device type
+#define NI_TAG_PRMY            0x70726d79  // "prmy" — primary instance
+#define NI_TAG_TRUE            0x74727565  // "true" — success flag
+#define NI_TAG_STRT            0x73747274  // "strt" — start command
+
+// ---------------------------------------------------------------------------
+// Opaque connection handle
+// ---------------------------------------------------------------------------
+
 typedef struct mk1_ipc_connection mk1_ipc_connection_t;
 
-// Callback: called when NIHardwareAgent sends us a message
-// (i.e. forwarding hardware events it received — in our case we
-//  are the hardware source, so this path may not be used, but
-//  we need it for the handshake ack messages)
-typedef void (*mk1_ipc_message_cb_t)(CFDataRef data, void *context);
+// ---------------------------------------------------------------------------
+// Callback — called when NIHA sends us a message
+// Signature includes msgid so we can distinguish handshake acks from events
+// ---------------------------------------------------------------------------
 
-// Connect to NIHardwareAgent and perform handshake
-// Returns NULL on failure
+typedef void (*mk1_ipc_message_cb_t)(SInt32 msgid,
+                                      CFDataRef data,
+                                      void *context);
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// Connect to NIHardwareAgent bootstrap port — returns NULL if NIHA is not running
 mk1_ipc_connection_t *mk1_ipc_connect(mk1_ipc_message_cb_t callback,
                                        void *context);
 
-// Disconnect cleanly
+// Disconnect and free all resources
 void mk1_ipc_disconnect(mk1_ipc_connection_t *conn);
 
-// Send a raw message to NIHardwareAgent
-bool mk1_ipc_send(mk1_ipc_connection_t *conn,
-                  const uint8_t *data, size_t len);
-
-// ---------------------------------------------------------------------------
-// Higher-level helpers (stubs — fill in once message format is confirmed)
-// ---------------------------------------------------------------------------
-
-// Perform the initial handshake sequence
-// TODO: fill in from Macchina / NIProtocol source analysis
+// Perform the PID Connect handshake with NIHA (synchronous)
+// On success, NIHA returns request + notification port names.
+// We create the notification port and acknowledge it.
+// Returns true if handshake completed and ports are established.
 bool mk1_ipc_handshake(mk1_ipc_connection_t *conn);
 
-// Forward a pad event to NIHardwareAgent as if it came from hardware
-bool mk1_ipc_send_pad_event(mk1_ipc_connection_t *conn,
-                             const uint8_t *pad_data, size_t len);
+// Send raw bytes with a given message ID to NIHA
+bool mk1_ipc_send(mk1_ipc_connection_t *conn,
+                  SInt32 msgid,
+                  const uint8_t *data,
+                  size_t len);
 
-// Forward a button event
+// Forward hardware events to NIHA
+bool mk1_ipc_send_pad_event(mk1_ipc_connection_t *conn,
+                             const uint8_t *data, size_t len);
+
 bool mk1_ipc_send_button_event(mk1_ipc_connection_t *conn,
-                                const uint8_t *button_data, size_t len);
+                                const uint8_t *data, size_t len);
+
+// Returns the device serial number received during handshake
+// Only valid after NIHA responds in step 5
+// Returns empty string if not yet received
+const char *mk1_ipc_get_serial(mk1_ipc_connection_t *conn);

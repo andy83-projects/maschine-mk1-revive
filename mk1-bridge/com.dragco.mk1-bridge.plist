@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Unique label for launchd -->
+    <key>Label</key>
+    <string>com.dragco.mk1-bridge</string>
+
+    <!-- Path to our built daemon -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/mk1-bridge</string>
+    </array>
+
+    <!-- Start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it crashes -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Log output -->
+    <key>StandardOutPath</key>
+    <string>/tmp/mk1-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mk1-bridge.log</string>
+
+    <!--
+        IMPORTANT: We need to start AFTER NIHardwareAgent is running
+        but BEFORE Maschine.app opens — so that we can:
+          1. Claim the USB device first
+          2. Present ourselves to NIHA via IPC
+
+        TODO: Determine correct ordering relative to NIHardwareAgent's
+        own LaunchAgent plist. May need to add a WaitForDependency or
+        a startup delay, or watch for NIHA's Mach port to appear.
+    -->
+
+</dict>
+</plist>

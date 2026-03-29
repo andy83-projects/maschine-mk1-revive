@@ -1,7 +1,6 @@
 .DS_Store
 *.o
 *.a
-*.dylib
 build/
 DerivedData/
 *.xcuserstate

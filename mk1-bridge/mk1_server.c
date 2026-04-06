@@ -104,7 +104,7 @@ static const char *message_name(uint32_t msg_type)
     case NI_EVT_DEVICE_OFF: return "DEVICE_OFF";
     case NI_EVT_PAD_DATA: return "PAD_DATA";
     case NI_EVT_BTN_DATA: return "BTN_DATA";
-    case NI_EVT_KNOB_ROTATE: return "KNOB_ROTATE";
+    case NI_EVT_KNOB_ROTATE: return "KNOB_ANALOG";
     case NI_EVT_KNOB_4D: return "KNOB_4D";
     case NI_EVT_TOUCHSTRIP: return "TOUCHSTRIP";
     case NI_CMD_LED: return "LED";

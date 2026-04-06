@@ -57,7 +57,7 @@ static const char *ni_msg_name(uint32_t type)
     case 0x03444e2d: return "DEVICE_OFF";
     case 0x03504e00: return "PAD_DATA";
     case 0x03734e00: return "BTN_DATA";
-    case 0x03654e00: return "KNOB_ROTATE";
+    case 0x03654e00: return "KNOB_ANALOG";
     case 0x03774e00: return "KNOB_4D";
     case 0x03744e00: return "TOUCHSTRIP";
     case 0x036c7500: return "LED";

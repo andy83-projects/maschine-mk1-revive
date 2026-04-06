@@ -30,7 +30,7 @@
 #define NI_EVT_DEVICE_OFF      0x03444e2d  // Device state: OFF
 #define NI_EVT_PAD_DATA        0x03504e00  // Pad pressure data
 #define NI_EVT_BTN_DATA        0x03734e00  // Button state data
-#define NI_EVT_KNOB_ROTATE     0x03654e00  // Knob rotation
+#define NI_EVT_KNOB_ROTATE     0x03654e00  // Analog encoder-style event; may include idle noise
 #define NI_EVT_KNOB_4D         0x03774e00  // 4D encoder
 #define NI_EVT_TOUCHSTRIP      0x03744e00  // Touchstrip data
 

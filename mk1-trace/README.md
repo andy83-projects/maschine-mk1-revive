@@ -154,7 +154,10 @@ uint32_t event_type;     // observed: 1=hit_on, 3=hit_off, 4=pressure
 float    value;          // normalized 0.0-1.0
 ```
 
-- `KNOB_ROTATE` is confirmed by Frida as a 24-byte payload with a signed float delta.
+- `KNOB_ROTATE` is a confirmed 24-byte payload with an analog-style signed float delta.
+- The April 5, 2026 IPC sniffer capture emitted repeated `0x03654e00` notifications during
+  handshake/UI initialization with no known user control movement, so treat the event as
+  encoder-style traffic that may include idle noise rather than as confirmed user knob turns.
 - The timestamp fields observed in Frida traffic are consistent with a 64-bit monotonic nanosecond clock split high word first.
 - `BTN_DATA` framing is currently understood as:
 

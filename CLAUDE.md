@@ -218,13 +218,17 @@ struct PadEventRecord {
 Float value examples: 0.424 (medium strike), 0.759 (hard strike), 0.292 (pressure).
 NIHA emits separate hit_on + hit_off + pressure_update records, not raw USB pressure bytes.
 
-#### Knob rotation (NI_EVT_KNOB_ROTATE = 0x03654E00) — 24 bytes for 1 record
+#### Analog encoder-style event (NI_EVT_KNOB_ROTATE = 0x03654E00) — 24 bytes for 1 record
 ```c
 struct KnobRecord {
-    uint32_t encoder_index; // e.g. 0x0a = volume knob
-    float    delta;         // signed; negative=CCW, positive=CW; one detent ≈ ±0.01
+    uint32_t encoder_index; // likely encoder/control index; observed stable per source
+    float    delta;         // analog-style signed delta; may include idle jitter/noise
 };
 ```
+The 24-byte payload shape is confirmed, but the April 5, 2026 IPC sniffer capture
+showed repeated 0x03654E00 notifications during idle startup/UI activity. Treat
+this as an analog encoder-style event that may include noise, not as confirmed
+user knob movement from that capture alone.
 
 #### Button event (NI_EVT_BTN_DATA = 0x03734E00) — variable
 ```c

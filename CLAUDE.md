@@ -59,41 +59,81 @@ for the LED IPC→EP1 payload translation.
 
 ### LED output (EP1 / selector 6)
 - Command: `0x0c` (DIMM_LEDS) on **EP1**, never EP8
-- Wire format: `{ 0x0c, phys[0], phys[1], ..., phys[31] }` — **33 bytes total, NO start_index**
-  (confirmed from usb.pcapng; earlier `start_index` description was incorrect)
-- `sendCommand` in the kext rejects payloads `>= 0x40` (64 bytes)
+- Wire format: `{ 0x0c, phys[0], phys[1], ..., phys[32] }` — **34 bytes total** (extended for pad rubber LEDs)
+  (usb.pcapng shows 33-byte packets from old Maschine; extended to 34 for current Maschine's pad rubber data)
+- `sendCommand` in the kext rejects payloads `>= 0x40` (64 bytes); 34 bytes is well within limit
 - LED stability requires a live EP1 command-reply loop (`commandReplyDispatch` in kext
   continuously re-arms EP1-in reads; without this, repeated writes may stall)
 
-#### IPC → EP1 LED pipeline (confirmed from bridge + pcap)
+#### IPC → EP1 LED pipeline (confirmed from bridge logs 2026-04-06)
 IPC `NI_CMD_LED` (0x036c7500) message layout:
 ```
 bytes[0..3]  = msg_type (NI_CMD_LED)
 bytes[4..7]  = led_len  (LE uint32, observed = 57)
-bytes[8..39] = logical brightness array indices 0–31  ← remap these 32 bytes
-bytes[40..]  = extra bytes for other NI devices; ignore (cap at 32)
+bytes[8..39] = logical[0..31]  — button/group/transport brightness ← remap via hw_by_logical
+bytes[40..43]= logical[32..35] — unused (other NI device slots)
+bytes[44..59]= logical[36..51] — pad rubber LED brightness for pads 1–16
+               logical[N+36] = pad N brightness (N=1..16, i.e. logical[37]=pad1, logical[52]=pad16)
 ```
-Apply `hw_by_logical` remap, then send 33-byte EP1 packet.
+Apply `hw_by_logical` remap for button LEDs, inject logical[37..52] → phys[17..32] for rubber LEDs,
+then send 34-byte EP1 packet.
 
-#### Confirmed LED index → physical button map (0-indexed)
-| Index | Button | Index | Button |
-|-------|--------|-------|--------|
-| 0 | (no effect) | 16 | pad 13 |
-| 1 | pad 4 | 17 | mute |
-| 2 | pad 3 | 18 | solo |
-| 3 | pad 2 | 19 | select |
-| 4 | pad 1 | 20 | duplicate |
-| 5 | pad 8 | 21 | navigate |
-| 6 | pad 7 | 22 | pad mode |
-| 7 | pad 6 | 23 | pattern |
-| 8 | pad 5 | 24 | scene |
-| 9 | pad 12 | 25 | shift |
-| 10 | pad 11 | 26 | erase |
-| 11 | pad 10 | 27 | grid |
-| 12 | pad 9 | 28 | forward |
-| 13 | pad 16 | 29 | record |
-| 14 | pad 15 | 30 | play |
-| 15 | pad 14 | 31 | (no effect) |
+**Note**: The IPC payload offset changed between Maschine versions. Old Maschine (Intel/pcap era)
+placed pad rubber data at logical[17..31] (within 32 bytes, so old 33-byte EP1 packets worked).
+Current Maschine (Apple Silicon) places rubber data at logical[37..52] — confirmed from led.log
+velocity-flash correlation: pressing pad 3 flashes both logical[3] (Group G button) and
+logical[39] (pad 3 rubber) to 0x3f simultaneously.
+
+#### Confirmed physical EP1 position → hardware (0-indexed)
+phys[0] = constant `0x1e` in all original NIHA full-state packets (unknown purpose —
+may be a control/enable register; "no effect" was incorrect).
+
+| phys pos | Confirmed | phys pos | Confirmed |
+|----------|-----------|----------|-----------|
+| 0  | 0x1e control reg (purpose TBD) | 17 | pad 1 rubber LED |
+| 1  | dead / no LED visible          | 18 | pad 2 rubber LED |
+| 2  | Group G                        | 19 | pad 3 rubber LED |
+| 3  | Group H                        | 20 | pad 4 rubber LED |
+| 4  | Restart (transport)            | 21 | pad 5 rubber LED |
+| 5  | Left navigation (transport)    | 22 | pad 6 rubber LED |
+| 6  | Group E                        | 23 | pad 7 rubber LED |
+| 7  | Group F                        | 24 | pad 8 rubber LED |
+| 8  | Group C                        | 25 | pad 9 rubber LED |
+| 9  | Group D                        | 26 | pad 10 rubber LED |
+| 10 | Skip                           | 27 | pad 11 rubber LED |
+| 11 | Auto Write                     | 28 | pad 12 rubber LED |
+| 12 | Group A                        | 29 | pad 13 rubber LED |
+| 13 | Group B                        | 30 | pad 14 rubber LED |
+| 14 | Browse                         | 31 | pad 15 rubber LED |
+| 15 | Sampling                       | 32 | pad 16 rubber LED |
+| 16 | Modules Left                   |    |                   |
+
+#### Logical IPC index → physical EP1 position
+Button/group/transport LEDs via `hw_by_logical[32]` in `mk1-bridge/main.c`:
+```
+logical[0]  → phys[0]   (0x1e control reg)
+logical[1]  → phys[4]   = Restart
+logical[2]  → phys[3]   = Group H
+logical[3]  → phys[2]   = Group G
+logical[4]  → phys[1]   = dead/no LED
+logical[5]  → phys[8]   = Group C
+logical[6]  → phys[7]   = Group F
+logical[7]  → phys[6]   = Group E
+logical[8]  → phys[5]   = Left navigation
+logical[9]  → phys[12]  = Group A
+logical[10] → phys[11]  = Auto Write
+logical[11] → phys[10]  = Skip
+logical[12] → phys[9]   = Group D
+logical[13] → phys[16]  = Modules Left
+logical[14] → phys[15]  = Sampling
+logical[15] → phys[14]  = Browse
+logical[16] → phys[13]  = Group B
+logical[17..31] → phys[17..31] (identity; unused — pad rubbers are at logical[37..52])
+```
+Pad rubber LEDs (direct, no remap table):
+```
+logical[37+K] → phys[17+K]  for K=0..15  (pad 1..16 rubber LEDs → phys[17..32])
+```
 
 #### LED brightness tiers (from Frida trace of real NIHA)
 Firmware uses three discrete levels, not a linear 0–255 scale:

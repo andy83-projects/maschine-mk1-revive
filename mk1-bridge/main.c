@@ -180,14 +180,17 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
 // ---------------------------------------------------------------------------
 // LED: IPC -> USB
 //
-// NI_CMD_LED wire format (confirmed from bridge logs 2026-04-05):
+// NI_CMD_LED wire format (confirmed from bridge logs 2026-04-06):
 //   bytes[0..3]  = msg_type (NI_CMD_LED = 0x036c7500)
 //   bytes[4..7]  = led_len  (LE uint32, observed = 57)
-//   bytes[8..39] = logical brightness array indices 0–31  ← remap these
-//   bytes[40..]  = extra (other NI device slots, ignored; cap at 32)
+//   bytes[8..39] = logical[0..31]  — button/group/transport LEDs → remap via hw_by_logical
+//   bytes[44..59]= logical[36..51] — pad rubber LEDs for pads 1–16 (logical[N+36] = pad N+1)
+//                  (bytes[40..43] = logical[32..35], not used)
 //
 // EP1 DIMM_LEDS format (confirmed from usb.pcapng):
-//   [0x0c, phys[0], phys[1], ..., phys[31]]  — 33 bytes, NO start_index
+//   [0x0c, phys[0], ..., phys[32]]  — 34 bytes total (extended for pad rubber LEDs)
+//   phys[0..16]  = button/group/transport LEDs (remapped from logical[0..31])
+//   phys[17..32] = pad rubber LEDs (logical[37+K] → phys[17+K], K=0..15)
 //
 // Remap: hw_by_logical[logical_i] = physical_i
 // (ported from mk1_shim_remap_led_payload in mk1-shim/mk1_shim.c)
@@ -218,36 +221,49 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
     uint32_t led_len_hdr;
     memcpy(&led_len_hdr, raw_msg + 4, 4);
 
-    const uint8_t *led_logical = raw_msg + 8;
-    size_t led_len = led_len_hdr;
-    if (led_len > raw_len - 8) led_len = raw_len - 8;
-    if (led_len > 32) led_len = 32;   // hardware expects 32 LED bytes max
-
-    // Log the logical input (all led_len bytes)
-    {
-        char hex[32 * 3 + 1];
-        for (size_t i = 0; i < led_len; i++) snprintf(hex + i*3, 4, "%02x ", led_logical[i]);
-        hex[led_len * 3] = '\0';
-        LLOG("logical (%zu): %s", led_len, hex);
+    // Log the FULL raw IPC message to see all bytes (led_len may be > 32)
+    if (raw_len > 8) {
+        size_t full_len = raw_len - 8;
+        char hex[128 * 3 + 1];
+        size_t log_len = full_len < 128 ? full_len : 128;
+        for (size_t i = 0; i < log_len; i++) snprintf(hex + i*3, 4, "%02x ", raw_msg[8 + i]);
+        hex[log_len * 3] = '\0';
+        LLOG("full IPC payload (hdr_len=%u raw=%zu): %s", led_len_hdr, full_len, hex);
     }
 
-    // Remap logical → physical hardware indices, passing values through raw.
+    const uint8_t *led_logical = raw_msg + 8;
+    size_t full_len = raw_len - 8;
+
+    // Remap logical[0..31] → physical button/group/transport positions.
     // No normalization or boost: the shim (reference) does the same, and
     // Maschine sends 0x13/0x32/0x3f which the firmware accepts directly.
-    // Boosting dim pads to 0x32 previously made all active pads identical
-    // to a just-pressed pad, eliminating all visual feedback.
-    uint8_t remapped[32] = {0};
-    for (size_t i = 0; i < 32 && i < led_len; i++) {
+    // phys[33] covers pad 16 rubber LED at phys[32].
+    uint8_t remapped[33] = {0};
+    size_t btn_len = full_len < 32 ? full_len : 32;
+    for (size_t i = 0; i < 32 && i < btn_len; i++) {
         remapped[hw_by_logical[i]] = led_logical[i];
     }
+    // Original NIHA always sends 0x1e at phys[0] in full-state packets (pcap confirmed).
+    remapped[0] = 0x1e;
 
-    // Build and send DIMM_LEDS (0x0c) packet on EP1
-    uint8_t packet[33];
+    // Inject pad rubber LED data: logical[37+K] → phys[17+K] for K=0..15.
+    // Confirmed from led.log: logical[N+36] flashes to velocity on pad N press.
+    for (size_t k = 0; k < 16; k++) {
+        size_t src = 37 + k;
+        size_t dst = 17 + k;   // phys[17..32]
+        if (src < full_len) {
+            remapped[dst] = led_logical[src];
+        }
+    }
+
+    // Build and send extended DIMM_LEDS (0x0c) packet on EP1:
+    // 34 bytes = command byte + phys[0..32] (33 positions, covers pad 16 rubber at phys[32])
+    uint8_t packet[34];
     packet[0] = 0x0c;
     memcpy(packet + 1, remapped, sizeof(remapped));
 
     {
-        char hex[33 * 3 + 1];
+        char hex[34 * 3 + 1];
         for (size_t i = 0; i < sizeof(packet); i++) snprintf(hex + i*3, 4, "%02x ", packet[i]);
         hex[sizeof(packet) * 3] = '\0';
         LLOG("EP1 (%zu): %s", sizeof(packet), hex);

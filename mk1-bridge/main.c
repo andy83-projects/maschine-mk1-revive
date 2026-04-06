@@ -93,12 +93,13 @@ static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRun
 // ---------------------------------------------------------------------------
 // Display: IPC -> USB
 //
-// IPC DISPLAY message layout (assumption — IPC_DISPLAY_HDR_LEN unverified):
-//   [0..3]   cmd_type     (4 bytes)
-//   [4..7]   displayIndex (4 bytes, LE): 0=left, 1=right
-//   [8..11]  unknown
-//   [12..15] pixelDataLen (4 bytes, LE)
-//   [16+]    pixelData    (8bpp grayscale, 170x64 = 10880 bytes)
+// IPC DISPLAY message layout (validated from bridge logs / sniffer):
+//   [0..3]   cmd_type     (NI_CMD_DISPLAY)
+//   [4..7]   flags/index  (low byte = 0 left, 1 right; upper bits observed 0x10000000)
+//   [8..11]  frame/page   (observed 0 or 1)
+//   [12..15] format/flags (observed 0x00ff0040 or 0x00ff003c)
+//   [16..19] pixelDataLen (4 bytes, LE)
+//   [20+]    pixelData    (8bpp grayscale)
 //
 // USB EP8 framebuffer format (from usb.pcapng):
 //   First byte of payload is 0x5c (ST7529 RAMWR command).
@@ -109,9 +110,10 @@ static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRun
 //     last:    display_idx=base|0x01, <remainder bytes>
 // ---------------------------------------------------------------------------
 
-#define IPC_DISPLAY_HDR_LEN   16
+#define IPC_DISPLAY_HDR_LEN   20
 #define EP8_CHUNK_MAX         508
 #define ST7529_RAMWR          0x5c
+
 
 static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 {
@@ -132,9 +134,9 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
         return;
     }
 
-    uint8_t ipc_idx = raw_msg[0];
+    uint8_t ipc_idx = raw_msg[4];
     uint32_t pixel_len;
-    memcpy(&pixel_len, raw_msg + 12, 4);
+    memcpy(&pixel_len, raw_msg + 16, 4);
 
     if (pixel_len == 0 || (size_t)(IPC_DISPLAY_HDR_LEN + pixel_len) > raw_len) {
         DLOG("bad pixel_len=%u raw_len=%zu", pixel_len, raw_len);
@@ -228,29 +230,29 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         LLOG("logical (%zu): %s", led_len, hex);
     }
 
-    // Remap logical → physical hardware indices
-    uint8_t remapped[32];
-    memcpy(remapped, led_logical, led_len);
+    // Remap logical → physical hardware indices, passing values through raw.
+    // No normalization or boost: the shim (reference) does the same, and
+    // Maschine sends 0x13/0x32/0x3f which the firmware accepts directly.
+    // Boosting dim pads to 0x32 previously made all active pads identical
+    // to a just-pressed pad, eliminating all visual feedback.
+    uint8_t remapped[32] = {0};
     for (size_t i = 0; i < 32 && i < led_len; i++) {
-        size_t phys = hw_by_logical[i];
-        if (phys < led_len) {
-            remapped[phys] = led_logical[i];
-        }
+        remapped[hw_by_logical[i]] = led_logical[i];
     }
 
     // Build and send DIMM_LEDS (0x0c) packet on EP1
     uint8_t packet[33];
     packet[0] = 0x0c;
-    memcpy(packet + 1, remapped, led_len);
+    memcpy(packet + 1, remapped, sizeof(remapped));
 
     {
         char hex[33 * 3 + 1];
-        for (size_t i = 0; i < 1 + led_len; i++) snprintf(hex + i*3, 4, "%02x ", packet[i]);
-        hex[(1 + led_len) * 3] = '\0';
-        LLOG("EP1 (%zu): %s", 1 + led_len, hex);
+        for (size_t i = 0; i < sizeof(packet); i++) snprintf(hex + i*3, 4, "%02x ", packet[i]);
+        hex[sizeof(packet) * 3] = '\0';
+        LLOG("EP1 (%zu): %s", sizeof(packet), hex);
     }
 
-    if (!mk1_device_write_endpoint(br->usb, 0x01, packet, 1 + led_len)) {
+    if (!mk1_device_write_endpoint(br->usb, 0x01, packet, sizeof(packet))) {
         LLOG("EP1 write FAILED");
     }
 }

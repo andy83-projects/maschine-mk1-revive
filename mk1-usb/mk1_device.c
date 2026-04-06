@@ -108,6 +108,7 @@ static size_t mk1_remap_led_payload(const void *input_payload,
                                     size_t input_len,
                                     uint8_t *output_payload,
                                     size_t output_capacity);
+static uint8_t mk1_normalize_led_brightness(uint8_t value);
 static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
                                              const uint8_t *data,
                                              size_t len);
@@ -759,16 +760,42 @@ static size_t mk1_remap_led_payload(const void *input_payload,
     }
 
     memcpy(output_payload, input_payload, copy_len);
+    for (size_t i = 0; i < copy_len; i++) {
+        output_payload[i] = mk1_normalize_led_brightness(output_payload[i]);
+    }
 
     for (size_t logical_index = 0; logical_index < sizeof(hardware_index_by_logical); logical_index++) {
         size_t hardware_index = hardware_index_by_logical[logical_index];
         if (logical_index >= copy_len || hardware_index >= copy_len) {
             continue;
         }
-        output_payload[hardware_index] = ((const uint8_t *)input_payload)[logical_index];
+        output_payload[hardware_index] =
+            mk1_normalize_led_brightness(((const uint8_t *)input_payload)[logical_index]);
     }
 
     return copy_len;
+}
+
+static uint8_t mk1_normalize_led_brightness(uint8_t value)
+{
+    static const uint8_t tiers[] = { 0x13, 0x32, 0x5c };
+    uint8_t best = tiers[0];
+    unsigned best_distance = 0xff;
+
+    if (value == 0) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(tiers) / sizeof(tiers[0]); i++) {
+        unsigned distance = (value > tiers[i]) ? (unsigned)(value - tiers[i])
+                                               : (unsigned)(tiers[i] - value);
+        if (distance < best_distance) {
+            best = tiers[i];
+            best_distance = distance;
+        }
+    }
+
+    return best;
 }
 
 static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
@@ -1403,37 +1430,21 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
         usleep(10000);
     }
 
-    // 3. DIMM_LEDS bank 0 (0x0c, 0x00) — clear LEDs (indices 0-31)
+    // 3. DIMM_LEDS — clear the full 32-byte LED state frame.
+    // The validated EP1 format is [0x0c, phys0..phys31] with no start index.
     {
-        uint8_t leds_bank0[33];
-        memset(leds_bank0, 0, sizeof(leds_bank0));
-        leds_bank0[0] = 0x0c; // EP1_CMD_DIMM_LEDS
-        leds_bank0[1] = 0x00; // bank 0
-        if (!mk1_device_write_endpoint(dev, 0x01, leds_bank0, sizeof(leds_bank0))) {
-            fprintf(stderr, "[mk1-usb] init_hardware: DIMM_LEDS bank0 failed\n");
+        uint8_t leds_clear[33];
+        memset(leds_clear, 0, sizeof(leds_clear));
+        leds_clear[0] = 0x0c;
+        if (!mk1_device_write_endpoint(dev, 0x01, leds_clear, sizeof(leds_clear))) {
+            fprintf(stderr, "[mk1-usb] init_hardware: DIMM_LEDS clear failed\n");
             return false;
         }
         mk1_device_drain_ep1_replies(dev, 5, 4);
         usleep(2000);
     }
 
-    // 4. DIMM_LEDS bank 1 (0x0c, 0x1e) — clear LEDs (indices 32-59) + display backlight
-    //    Byte 29 (index 59) = 0x5c = display backlight brightness from capture
-    {
-        uint8_t leds_bank1[33];
-        memset(leds_bank1, 0, sizeof(leds_bank1));
-        leds_bank1[0] = 0x0c;  // EP1_CMD_DIMM_LEDS
-        leds_bank1[1] = 0x1e;  // bank 1 (offset 30)
-        leds_bank1[30] = 0x5c; // display backlight on
-        if (!mk1_device_write_endpoint(dev, 0x01, leds_bank1, sizeof(leds_bank1))) {
-            fprintf(stderr, "[mk1-usb] init_hardware: DIMM_LEDS bank1 failed\n");
-            return false;
-        }
-        mk1_device_drain_ep1_replies(dev, 5, 4);
-        usleep(2000);
-    }
-
-    // 5. EP8 display config — init BOTH displays (0x00=left, 0x02=right)
+    // 4. EP8 display config — init BOTH displays (0x00=left, 0x02=right)
     //    Controller: ST7529 family (not SSD1327).
     //    17-command sequence confirmed verbatim from usb.pcapng analysis.
     //    Format: [display_idx, len_hi, len_lo, command_data...]
@@ -1516,13 +1527,6 @@ bool mk1_device_replay_startup_init(mk1_device_t *dev)
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00
-        } },
-        { 0x01, 33, {
-            0x0c, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x5c, 0x00, 0x00,
             0x00
         } },
         { 0x08, 7, { 0x00, 0x00, 0x04, 0xca, 0x04, 0x0f, 0x00 } },
@@ -1641,14 +1645,20 @@ void mk1_device_stop(mk1_device_t *dev)
 
 bool mk1_set_led(mk1_device_t *dev, uint8_t led_index, uint8_t brightness)
 {
-    // Caiaq DIMM_LEDS (0x0c) on EP1: [cmd, start_index, brightness_bytes...]
-    uint8_t packet[3] = { 0x0c, led_index, brightness };
+    uint8_t packet[33] = {0};
 
     if (!dev || !dev->interface || dev->output_pipe_count == 0) {
         fprintf(stderr, "[mk1-usb] mk1_set_led unavailable: no output pipe\n");
         return false;
     }
+    if (led_index >= 32) {
+        fprintf(stderr, "[mk1-usb] mk1_set_led invalid index %u\n", led_index);
+        return false;
+    }
 
+    // Convenience helper: emit a complete 32-byte DIMM_LEDS frame with one slot set.
+    packet[0] = 0x0c;
+    packet[1 + led_index] = mk1_normalize_led_brightness(brightness);
     return mk1_device_write_endpoint(dev, 0x01, packet, sizeof(packet));
 }
 

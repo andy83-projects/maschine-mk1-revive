@@ -40,6 +40,9 @@ typedef struct {
     bool               have_last_report;
     size_t             last_report_len;
     uint8_t            last_report[MK1_READ_BUFFER_SIZE];
+    bool               have_last_scan_report;
+    size_t             last_scan_report_len;
+    uint8_t            last_scan_report[64];
 } mk1_pipe_reader_t;
 
 struct mk1_device {
@@ -61,6 +64,10 @@ struct mk1_device {
     mk1_button_callback_t    button_cb;
     void                    *cb_context;
     bool                     trace_reports;
+    bool                     trace_scan_reports;
+    bool                     scan_baseline_set;
+    size_t                   scan_baseline_len;
+    uint8_t                  scan_baseline[64];
 
     // Pad calibration: first EP4 report is captured as baseline.
     // Pressure is reported as delta above baseline, clamped to 0-4095.
@@ -492,6 +499,53 @@ static uint16_t read_le16(const uint8_t *data)
     return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
+static bool mk1_is_scanned_button_report(const uint8_t *data, size_t len)
+{
+    if (!data || len != 64) {
+        return false;
+    }
+
+    for (size_t i = 0; i < 16; i++) {
+        uint16_t current = read_le16(data + (i * 2));
+        uint16_t expected = (uint16_t)((read_le16(data) + (uint16_t)(i * 0x1000)) & 0xf000);
+        uint16_t duplicate = read_le16(data + 32 + (i * 2));
+
+        if (current != expected || duplicate != current) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static uint8_t mk1_scan_phase(const uint8_t *data, size_t len)
+{
+    if (!data || len < 2) {
+        return 0;
+    }
+    return (uint8_t)((read_le16(data) >> 12) & 0x0f);
+}
+
+static void mk1_normalize_scan_report(const uint8_t *input, size_t len, uint8_t *output)
+{
+    uint8_t phase = mk1_scan_phase(input, len);
+    size_t word_count = len / 2;
+
+    if (!input || !output || len != 64 || word_count < 16) {
+        return;
+    }
+
+    // The observed non-pad button report is a 16-word ring duplicated twice.
+    // Rotate it back to phase 0 so button-induced content deltas are comparable.
+    for (size_t i = 0; i < 16; i++) {
+        size_t source_index = (i + 16 - phase) & 0x0f;
+        output[(i * 2) + 0] = input[(source_index * 2) + 0];
+        output[(i * 2) + 1] = input[(source_index * 2) + 1];
+        output[32 + (i * 2) + 0] = output[(i * 2) + 0];
+        output[32 + (i * 2) + 1] = output[(i * 2) + 1];
+    }
+}
+
 static void log_hex_bytes(const uint8_t *data, size_t len, size_t max_len)
 {
     size_t limit = len < max_len ? len : max_len;
@@ -596,18 +650,20 @@ static void log_raw_report(mk1_pipe_reader_t *reader, const uint8_t *data, size_
 {
     mk1_device_t *dev = reader ? reader->device : NULL;
 
-    if (!dev || !dev->trace_reports) {
+    if (!dev || (!dev->trace_reports && !dev->trace_scan_reports)) {
         return;
     }
 
-    if (!reader->have_last_report) {
-        log_report_baseline(reader->pipe_ref, data, len);
-    } else {
-        log_report_change(reader->pipe_ref,
-                          reader->last_report,
-                          reader->last_report_len,
-                          data,
-                          len);
+    if (dev->trace_reports) {
+        if (!reader->have_last_report) {
+            log_report_baseline(reader->pipe_ref, data, len);
+        } else {
+            log_report_change(reader->pipe_ref,
+                              reader->last_report,
+                              reader->last_report_len,
+                              data,
+                              len);
+        }
     }
 
     if (len > sizeof(reader->last_report)) {
@@ -616,6 +672,68 @@ static void log_raw_report(mk1_pipe_reader_t *reader, const uint8_t *data, size_
     memcpy(reader->last_report, data, len);
     reader->last_report_len = len;
     reader->have_last_report = true;
+}
+
+static void log_scan_report(mk1_pipe_reader_t *reader, const uint8_t *data, size_t len)
+{
+    mk1_device_t *dev = reader ? reader->device : NULL;
+    bool changed = !reader || !reader->have_last_scan_report || reader->last_scan_report_len != len;
+    uint8_t normalized[64] = {0};
+    uint8_t diff_preview[16] = {0};
+    size_t diff_count = 0;
+    size_t preview_count = 0;
+
+    if (!dev || !dev->trace_scan_reports) {
+        return;
+    }
+
+    if (!changed && data) {
+        changed = memcmp(reader->last_scan_report, data, len) != 0;
+    }
+    if (!changed) {
+        return;
+    }
+
+    if (len == 64) {
+        mk1_normalize_scan_report(data, len, normalized);
+        if (!dev->scan_baseline_set) {
+            memcpy(dev->scan_baseline, normalized, len);
+            dev->scan_baseline_len = len;
+            dev->scan_baseline_set = true;
+        } else if (dev->scan_baseline_len == len) {
+            for (size_t i = 0; i < len; i++) {
+                if (normalized[i] != dev->scan_baseline[i]) {
+                    diff_count++;
+                    if (preview_count < sizeof(diff_preview)) {
+                        diff_preview[preview_count++] = (uint8_t)i;
+                    }
+                }
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "[mk1-usb] scan frame pipe=%u endpoint=%u len=%zu phase=%u base=0x%04x normalized_diff=%zu\n",
+            reader ? reader->pipe_ref : 0,
+            reader ? reader->endpoint_number : 0,
+            len,
+            mk1_scan_phase(data, len),
+            len >= 2 ? read_le16(data) : 0,
+            diff_count);
+    log_short_bytes("scan payload", data, len, 96);
+    if (preview_count > 0) {
+        fprintf(stderr, "[mk1-usb] scan normalized diff bytes:");
+        for (size_t i = 0; i < preview_count; i++) {
+            fprintf(stderr, " %u", diff_preview[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (reader && len <= sizeof(reader->last_scan_report)) {
+        memcpy(reader->last_scan_report, data, len);
+        reader->last_scan_report_len = len;
+        reader->have_last_scan_report = true;
+    }
 }
 
 static bool get_pipe_endpoint_number(const mk1_device_t *dev,
@@ -811,6 +929,15 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
     mk1_device_t *dev = reader ? reader->device : NULL;
 
     if (!dev || !data || len == 0) {
+        return;
+    }
+
+    // Some 64-byte EP4 reports are not pad pressure. The non-pad button/encoder
+    // state trace we captured is a duplicated 16-word scan table that steps by
+    // 0x1000 each slot. Ignore those for now so we don't misclassify them as
+    // pads or forward malformed BTN_DATA payloads into Maschine.
+    if (mk1_is_scanned_button_report(data, len)) {
+        log_scan_report(reader, data, len);
         return;
     }
 
@@ -1265,6 +1392,7 @@ mk1_device_t *mk1_device_open(void)
     mk1_device_t *dev = calloc(1, sizeof(mk1_device_t));
     if (!dev) return NULL;
     dev->trace_reports = env_flag_enabled("MK1_USB_TRACE");
+    dev->trace_scan_reports = env_flag_enabled("MK1_SCAN_TRACE");
     pthread_mutex_init(&dev->reply_lock, NULL);
 
     dev->service = find_matching_usb_service(dev->serial, sizeof(dev->serial));
@@ -1283,6 +1411,9 @@ mk1_device_t *mk1_device_open(void)
     }
     if (dev->trace_reports) {
         fprintf(stderr, "[mk1-usb] raw USB report tracing enabled via MK1_USB_TRACE\n");
+    }
+    if (dev->trace_scan_reports) {
+        fprintf(stderr, "[mk1-usb] scan-frame tracing enabled via MK1_SCAN_TRACE\n");
     }
     log_service_path(dev->service, kIOServicePlane, "device");
     log_service_path(dev->service, kIOUSBPlane, "device");

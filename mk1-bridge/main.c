@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <CoreFoundation/CoreFoundation.h>
 
 #include "mk1_server.h"
@@ -303,25 +304,85 @@ static void on_connect(void *ctx)
 // USB input callbacks
 // ---------------------------------------------------------------------------
 
+// NI_EVT_PAD_DATA wire format (from CLAUDE.md):
+//   uint32_t msg_type
+//   uint32_t timestamp_hi  (upper 32 bits of 64-bit monotonic ns clock)
+//   uint32_t timestamp_lo  (lower 32 bits)
+//   uint32_t count         (number of PadEventRecord records)
+//   PadEventRecord × count:
+//     uint32_t pad_index   (0-indexed)
+//     uint32_t event_type  (1=hit_on, 3=hit_off, 4=pressure_update)
+//     float    value       (normalized 0.0–1.0)
+#define PAD_EVT_HIT_ON           1
+#define PAD_EVT_PRESSURE_UPDATE  4
+#define PAD_EVT_HIT_OFF          3
+#define PAD_PRESSURE_MAX         4095.0f
+
+// EP4 64-byte pad report: pairs 0-15 (bytes 0-31) are pressure channels for 16 pads.
+// Confirmed from live hardware testing: EP4 pairs are in sequential pad order,
+// pair 0 = pad 1 (IPC idx 0), pair 15 = pad 16 (IPC idx 15).
+// No remap needed — pair index == IPC pad_index.
+
+static uint16_t g_prev_pressure[16] = {0};
+
+static void send_pad_record(mk1_server_t *srv,
+                             uint64_t ts_ns,
+                             uint32_t pad_index,
+                             uint32_t event_type,
+                             float value)
+{
+    // header(16) + 1 record(12) = 28 bytes
+    uint8_t buf[28];
+    uint32_t msg_type = NI_EVT_PAD_DATA;
+    uint32_t ts_hi    = (uint32_t)(ts_ns >> 32);
+    uint32_t ts_lo    = (uint32_t)(ts_ns & 0xffffffffu);
+    uint32_t cnt      = 1;
+
+    memcpy(buf +  0, &msg_type,   4);
+    memcpy(buf +  4, &ts_hi,      4);
+    memcpy(buf +  8, &ts_lo,      4);
+    memcpy(buf + 12, &cnt,        4);
+    memcpy(buf + 16, &pad_index,  4);
+    memcpy(buf + 20, &event_type, 4);
+    memcpy(buf + 24, &value,      4);
+
+    mk1_server_send_event(srv, buf, sizeof(buf));
+}
+
 static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
 {
     bridge_t *br = (bridge_t *)ctx;
     if (!br->srv || !mk1_server_is_connected(br->srv)) return;
 
-    for (uint8_t i = 0; i < count && i < 16; i++) {
-        BTNLOG("pad idx=%u pressure=%u", pads[i].index, pads[i].pressure);
-    }
+    struct timespec ts;
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+    uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
-    uint8_t buf[4 + 1 + 16 * 3];
-    uint32_t type = NI_EVT_PAD_DATA;
-    memcpy(buf, &type, 4);
-    buf[4] = count;
     for (uint8_t i = 0; i < count && i < 16; i++) {
-        buf[5 + i * 3] = pads[i].index;
-        buf[6 + i * 3] = (uint8_t)(pads[i].pressure >> 8);
-        buf[7 + i * 3] = (uint8_t)(pads[i].pressure & 0xff);
+        uint32_t idx      = pads[i].index;    // 0-15; pair index == IPC pad_index
+        uint16_t pressure = pads[i].pressure;
+        uint16_t prev     = g_prev_pressure[idx];
+
+        if (pressure == prev) continue;
+
+        float value = (pressure > 0) ? (pressure / PAD_PRESSURE_MAX) : 0.0f;
+
+        if (prev == 0 && pressure > 0) {
+            // pad struck — send hit_on then pressure_update
+            BTNLOG("pad idx=%u hit_on pressure=%u (%.3f)", idx, pressure, (double)value);
+            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON,          value);
+            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE,  value);
+        } else if (prev > 0 && pressure == 0) {
+            // pad released
+            BTNLOG("pad idx=%u hit_off", idx);
+            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_OFF, 0.0f);
+        } else {
+            // pressure changed while held
+            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
+        }
+
+        if (idx < 16) g_prev_pressure[idx] = pressure;
     }
-    mk1_server_send_event(br->srv, buf, 5 + (size_t)count * 3);
 }
 
 static void on_button(const mk1_button_event_t *ev, void *ctx)

@@ -46,6 +46,17 @@ for the LED IPC→EP1 payload translation.
 - **EP4 (0x04/0x84)** — bulk in/out, high-bandwidth (audio/pad data)
 - **EP8 (0x08)** — bulk out, **all display traffic only**
 
+### EP4 pad input format (confirmed from live hardware testing 2026-04-06)
+- 64-byte reports at ~700 Hz; no report-ID prefix byte
+- Layout: `[pad0_lo, pad0_hi, pad1_lo, pad1_hi, ..., pad15_lo, pad15_hi, <32-byte duplicate channel B>]`
+- Channel A = bytes 0–31: 16 × LE uint16 pressure values, one per pad
+- Channel B = bytes 32–63: second ADC reading of same 16 pads (values track channel A; use A only)
+- **Pad order is sequential**: pair 0 = pad 1 (idx 0), pair 15 = pad 16 (idx 15). No remap needed.
+- Pad numbering: pad 1 = bottom-left, pad 16 = top-right (standard Maschine grid order, bottom-to-top)
+- Baseline calibration: first report received contains resting ADC values per pad; subtract baseline
+  before using as pressure. Resting values observed: pair 0 = 0x0000, pairs 1–15 = increments of 0x1000.
+- Pressure range after baseline subtraction: 0–4095 (12-bit), normalize to 0.0–1.0 for IPC
+
 ### LED output (EP1 / selector 6)
 - Command: `0x0c` (DIMM_LEDS) on **EP1**, never EP8
 - Wire format: `{ 0x0c, phys[0], phys[1], ..., phys[31] }` — **33 bytes total, NO start_index**

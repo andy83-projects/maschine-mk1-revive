@@ -61,6 +61,12 @@ struct mk1_device {
     mk1_button_callback_t    button_cb;
     void                    *cb_context;
     bool                     trace_reports;
+
+    // Pad calibration: first EP4 report is captured as baseline.
+    // Pressure is reported as delta above baseline, clamped to 0-4095.
+    bool                     pad_baseline_set;
+    uint16_t                 pad_baseline[MK1_PAD_COUNT];
+
     pthread_mutex_t          reply_lock;
     bool                     have_device_spec_reply;
     bool                     have_user_data_reply;
@@ -808,12 +814,28 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
         return;
     }
 
-    if (data[0] == MK1_REPORT_PADS && len >= 1 + (MK1_PAD_COUNT * 2)) {
-        mk1_pad_event_t pads[MK1_PAD_COUNT];
+    // EP4 pad pressure report: 64 bytes, no report-ID prefix.
+    // pcap confirms: pad[i] raw value is at bytes[i*2 .. i*2+1] (LE uint16).
+    // Bytes[0..31] = first 16 pad channels; bytes[32..63] = second channel (ignored).
+    //
+    // The first report received is used as a per-pad baseline (resting level).
+    // Pressure is reported as delta above baseline, clamped to [0, 4095].
+    // This eliminates false-positive events from non-zero resting values.
+    if (len == 64) {
+        if (!dev->pad_baseline_set) {
+            for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
+                dev->pad_baseline[i] = read_le16(data + (i * 2));
+            }
+            dev->pad_baseline_set = true;
+            return;  // skip this first report; it is calibration only
+        }
 
+        mk1_pad_event_t pads[MK1_PAD_COUNT];
         for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
-            pads[i].index = i;
-            pads[i].pressure = read_le16(data + 1 + (i * 2));
+            uint16_t raw    = read_le16(data + (i * 2));
+            int32_t  delta  = (int32_t)raw - (int32_t)dev->pad_baseline[i];
+            pads[i].index    = i;
+            pads[i].pressure = (uint16_t)(delta <= 0 ? 0 : (delta > 4095 ? 4095 : delta));
         }
 
         if (dev->pad_cb) {
@@ -822,24 +844,11 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
         return;
     }
 
-    if (data[0] == MK1_REPORT_BUTTONS) {
-        if (dev->button_cb) {
-            mk1_button_event_t event;
-            size_t copy_len = len < sizeof(event.raw) ? len : sizeof(event.raw);
-
-            memset(&event, 0, sizeof(event));
-            event.len = copy_len;
-            memcpy(event.raw, data, copy_len);
-            dev->button_cb(&event, dev->cb_context);
-        }
-        return;
-    }
-
     if (dev->trace_reports) {
         fprintf(stderr,
-                "[mk1-usb] ignoring unknown input report id=0x%02x len=%zu from pipe=%u endpoint=%u\n",
-                data[0],
+                "[mk1-usb] ignoring unknown input report len=%zu byte0=0x%02x from pipe=%u endpoint=%u\n",
                 len,
+                data[0],
                 reader ? reader->pipe_ref : 0,
                 reader ? reader->endpoint_number : 0);
         log_short_bytes("ignored input report", data, len, 96);

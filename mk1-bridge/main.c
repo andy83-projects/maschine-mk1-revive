@@ -49,7 +49,7 @@ static void open_logs(void)
     if (!home) home = "/tmp";
 
     char dir[512];
-    snprintf(dir, sizeof(dir), "%s/Library/Logs/mk1-bridge", home);
+    snprintf(dir, sizeof(dir), "%s/Documents/GitRepos/maschine-mk1-revive/build/Debug/bridge-logs", home);
     mkdir(dir, 0755);   // no-op if already exists
 
     char path[600];

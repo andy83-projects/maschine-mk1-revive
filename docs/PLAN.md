@@ -2,6 +2,19 @@
 
 Last updated: 2026-04-05
 
+## Consensus (settled 2026-04-05)
+
+1. `mk1-bridge` is the primary path. `mk1-shim` is reference only — this is closed.
+2. Immediate next task: run `mk1-ipc-sniffer` against real NIHA, capture a live
+   `NI_CMD_DISPLAY` packet, verify display header offsets.
+3. Fix `forward_display()` against the capture.
+4. Only then do a minimal split (LED/display packet construction into shared helpers)
+   if duplicated code is still causing regressions.
+
+Do not restart. Do not broad-refactor. Do not touch architecture until step 3 is done.
+
+---
+
 ## Architecture Decision: Bridge (not Shim)
 
 The bridge (`mk1-bridge`) kills NIHardwareAgent, registers `NIHWMainHandler`, and owns

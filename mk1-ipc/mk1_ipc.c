@@ -2,28 +2,12 @@
 //
 // NIHardwareAgent IPC bridge implementation.
 //
-// Protocol based on:
+// Protocol based primarily on biappi/Macchina's MK1-era reverse engineering.
 //
-//   terminar/rebellion (2021, most accurate):
-//     - Confirmed synchronous PID Connect: send device ID, get port names back
-//     - Two-phase: PID connect (device-level), then serial connect (instance)
-//     - Notes SamL98's bootstrap assumptions were wrong
-//     - MK1 (0x0808) uses NIHWMainHandler bootstrap port
-//
-//   biappi/Macchina (2012, MK1):
-//     - First RE of MK1 IPC, confirmed CFMessagePort mechanism
-//     - MK1 protocol uses synchronous request/reply
-//     - Device connect returns request + notification port names
-//
-//   SamL98/NIProtocol (2019, MK2):
-//     - Detailed handshake docs but some bootstrap assumptions wrong per terminar
-//
-// ---------------------------------------------------------------------------
-// Protocol (MK2+ wire format, confirmed working for MK1 by Rebellion):
-//
-// All messages: CFMessagePortSendRequest with msgid=0.
-// Message type is the first uint32 in the payload.
-// All uint32 fields are big-endian.
+// The implementation here sticks to the simpler controller-level handshake:
+//   - msgid is always 0
+//   - message type is the first uint32 in the payload
+//   - uint32 fields are written in native byte order
 //
 // Step 1: PID Connect → bootstrap port ("NIHWMainHandler")
 //   Send:  [0x03447500, device_id, "NiM2", "prmy", 0x00000000]
@@ -192,15 +176,12 @@ static CFDataRef send_and_recv(CFMessagePortRef port,
 // ---------------------------------------------------------------------------
 // Internal: parse PID Connect reply
 //
-// Expected format (from Rebellion):
+// Expected format:
 //   bytes 0-3:  "true" flag (0x74727565) or "fail"
 //   bytes 4-7:  req_port_name_len (little-endian int32!)
 //   bytes 8+:   req_port_name (ASCII, len bytes)
 //   next 4:     notif_port_name_len (little-endian int32)
 //   next N:     notif_port_name (ASCII, len bytes)
-//
-// Note: Rebellion uses sunpack("!4<ii", ...) — little-endian ints after the
-// initial "true" tag. The "true" is read as raw bytes, not swapped.
 // ---------------------------------------------------------------------------
 
 static bool parse_pid_connect_reply(CFDataRef reply,
@@ -348,7 +329,7 @@ void mk1_ipc_disconnect(mk1_ipc_connection_t *conn)
 // ---------------------------------------------------------------------------
 // Public API — handshake
 //
-// Rebellion-confirmed protocol:
+// MK1-style protocol:
 //   1. PID Connect to bootstrap → get port names back synchronously
 //   2. Create local notification port
 //   3. Connect to request port
@@ -368,45 +349,15 @@ bool mk1_ipc_handshake(mk1_ipc_connection_t *conn)
     CFDataRef reply;
 
     // ----- Probe: GetServiceVersion -----
-    // Tests if NIHA responds to the MK2/3 wire format (msgid=0, type in payload)
     buf_init(&m);
     buf_push_u32(&m, NI_MSG_VERSION);
     payload = buf_to_cfdata(&m);
     reply = send_and_recv(conn->bootstrap_port, payload,
                            "GetServiceVersion (probe)");
     CFRelease(payload);
-    bool modern_protocol = (reply && CFDataGetLength(reply) > 0);
     if (reply) CFRelease(reply);
 
-    if (!modern_protocol) {
-        // Try MK1-era protocol: msgid = message ID, not in payload
-        // Macchina: msgid=0x02536756 for GetServiceVersion
-        fprintf(stderr, "[mk1-ipc] modern protocol got no reply, trying MK1 protocol...\n");
-
-        buf_init(&m);
-        payload = buf_to_cfdata(&m);  // empty payload, type in msgid
-
-        CFDataRef mk1_reply = NULL;
-        SInt32 result = CFMessagePortSendRequest(conn->bootstrap_port,
-                                                  0x02536756,  // MK1 GetServiceVersion
-                                                  payload,
-                                                  5.0, 5.0,
-                                                  kCFRunLoopDefaultMode,
-                                                  &mk1_reply);
-        CFRelease(payload);
-        fprintf(stderr, "[mk1-ipc] MK1 GetServiceVersion (msgid=0x02536756): result=%d\n",
-                (int)result);
-        if (mk1_reply && CFDataGetLength(mk1_reply) > 0) {
-            log_cfdata("mk1-version-reply", mk1_reply);
-            modern_protocol = false;  // use MK1 protocol path
-        } else {
-            fprintf(stderr, "[mk1-ipc] MK1 protocol also got no reply\n");
-        }
-        if (mk1_reply) CFRelease(mk1_reply);
-    }
-
     // ----- Step 1: PID Connect -----
-    // Modern: [msg_type, device_id, "NiM2", "prmy", 0] with msgid=0
     buf_init(&m);
     buf_push_u32(&m, NI_MSG_PID_CONNECT);
     buf_push_u32(&m, MK1_DEVICE_ID);
@@ -416,51 +367,11 @@ bool mk1_ipc_handshake(mk1_ipc_connection_t *conn)
     payload = buf_to_cfdata(&m);
 
     reply = send_and_recv(conn->bootstrap_port, payload,
-                           "PID Connect (modern, 0x0808 MK1)");
+                           "PID Connect (0x0808 MK1)");
     CFRelease(payload);
 
-    // If modern protocol failed, try MK1-era DeviceConnect
     if (!reply || CFDataGetLength(reply) == 0) {
-        if (reply) CFRelease(reply);
-        fprintf(stderr, "[mk1-ipc] modern PID Connect got no data, trying MK1 DeviceConnect...\n");
-
-        // Macchina MK1: msgid=0x02444300
-        // Payload: [0x02444300, controllerId, 'NiMS', 'prmy', nameLen, name_utf16...]
-        // We'll use a minimal client name "mk1" as UTF-16LE
-        const char *client_name = "mk1-bridge";
-        size_t name_chars = strlen(client_name);
-
-        buf_init(&m);
-        buf_push_u32(&m, 0x02444300);          // message ID in payload too
-        buf_push_u32(&m, MK1_DEVICE_ID);       // 0x0808
-        buf_push_u32(&m, 0x4e694d53);          // "NiMS"
-        buf_push_u32(&m, NI_TAG_PRMY);         // "prmy"
-        buf_push_u32(&m, (uint32_t)name_chars); // name length in UTF-16 chars
-        // Push name as UTF-16LE (each char as 2 bytes, little-endian)
-        for (size_t i = 0; i < name_chars; i++) {
-            uint8_t utf16le[2] = { (uint8_t)client_name[i], 0 };
-            buf_push_bytes(&m, utf16le, 2);
-        }
-        payload = buf_to_cfdata(&m);
-
-        CFDataRef mk1_reply = NULL;
-        SInt32 result = CFMessagePortSendRequest(conn->bootstrap_port,
-                                                  0x02444300,  // MK1 DeviceConnect
-                                                  payload,
-                                                  5.0, 5.0,
-                                                  kCFRunLoopDefaultMode,
-                                                  &mk1_reply);
-        CFRelease(payload);
-        fprintf(stderr, "[mk1-ipc] MK1 DeviceConnect (msgid=0x02444300): result=%d\n",
-                (int)result);
-        if (mk1_reply && CFDataGetLength(mk1_reply) > 0) {
-            log_cfdata("mk1-connect-reply", mk1_reply);
-        }
-        reply = mk1_reply;
-    }
-
-    if (!reply || CFDataGetLength(reply) == 0) {
-        fprintf(stderr, "[mk1-ipc] no reply from either protocol.\n"
+        fprintf(stderr, "[mk1-ipc] no reply from PID Connect.\n"
                         "[mk1-ipc] stock NIHA may have dropped MK1 support.\n"
                         "[mk1-ipc] try with patched NIHA:\n"
                         "[mk1-ipc]   kill NIHA: launchctl bootout gui/$(id -u) /Library/LaunchAgents/com.native-instruments.NIHardwareAgent.plist\n"
@@ -527,12 +438,13 @@ bool mk1_ipc_handshake(mk1_ipc_connection_t *conn)
     fprintf(stderr, "[mk1-ipc] request port connected\n");
 
     // ----- Step 4: ACK notification port -----
-    // Send to REQUEST port: [msg_type, "true", 0, name_len, name_bytes]
-    size_t name_len = strlen(conn->notif_port_name);
+    // Send to REQUEST port: [msg_type, 0, 0, name_len, name_bytes]
+    // Sniffer confirms: second word is 0, NOT "true" as previously assumed
+    size_t name_len = strlen(conn->notif_port_name) + 1; // include null terminator
 
     buf_init(&m);
     buf_push_u32(&m, NI_MSG_ACK_NOTIF_PORT);
-    buf_push_u32(&m, NI_TAG_TRUE);
+    buf_push_u32(&m, 0);
     buf_push_u32(&m, 0);
     buf_push_u32(&m, (uint32_t)name_len);
     buf_push_bytes(&m, conn->notif_port_name, name_len);
@@ -541,10 +453,13 @@ bool mk1_ipc_handshake(mk1_ipc_connection_t *conn)
     reply = send_and_recv(conn->request_port, payload,
                            "ACK notification port");
     CFRelease(payload);
-    if (reply) {
-        log_cfdata("ack-reply", reply);
-        CFRelease(reply);
+    if (!reply || CFDataGetLength(reply) < 4) {
+        fprintf(stderr, "[mk1-ipc] ACK notification port failed\n");
+        if (reply) CFRelease(reply);
+        return false;
     }
+    log_cfdata("ack-reply", reply);
+    CFRelease(reply);
 
     // ----- Done -----
     conn->handshake_done = true;
@@ -571,6 +486,28 @@ bool mk1_ipc_send(mk1_ipc_connection_t *conn,
                                               NULL, NULL);
     CFRelease(payload);
     return result == kCFMessagePortSuccess;
+}
+
+// ---------------------------------------------------------------------------
+// Public API — synchronous query to request port
+// ---------------------------------------------------------------------------
+
+CFDataRef mk1_ipc_query(mk1_ipc_connection_t *conn,
+                         const uint8_t *data, size_t len)
+{
+    if (!conn || !conn->request_port || !data) return NULL;
+    CFDataRef payload = CFDataCreate(NULL, data, (CFIndex)len);
+    CFDataRef reply = NULL;
+
+    SInt32 result = CFMessagePortSendRequest(conn->request_port,
+                                              0,
+                                              payload,
+                                              5.0, 5.0,
+                                              kCFRunLoopDefaultMode,
+                                              &reply);
+    CFRelease(payload);
+    if (result != kCFMessagePortSuccess) return NULL;
+    return reply;
 }
 
 // ---------------------------------------------------------------------------

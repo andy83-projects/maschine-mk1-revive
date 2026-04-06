@@ -102,63 +102,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // --- Diagnostic: raw PID Connect probe for multiple device IDs ---
-    // Test whether NIHA responds to ANY device, not just MK1
-    printf("\n[test] === DEVICE PROBE ===\n");
-    printf("[test] sending raw PID Connect for multiple device IDs...\n\n");
-
-    struct { uint16_t id; const char *name; } devices[] = {
-        { 0x1600, "Maschine MK3" },
-        { 0x1610, "Komplete Kontrol MK2" },
-        { 0x1140, "Maschine MK2" },
-        { 0x1300, "Maschine Studio" },
-        { 0x0808, "Maschine MK1" },
-        { 0, NULL }
-    };
-
-    // Get bootstrap port for raw sends
-    CFStringRef bname = CFStringCreateWithCString(NULL, NIHA_BOOTSTRAP_PORT,
-                                                   kCFStringEncodingUTF8);
-    CFMessagePortRef bport = CFMessagePortCreateRemote(NULL, bname);
-    CFRelease(bname);
-
-    for (int i = 0; devices[i].name; i++) {
-        // Build: [0x03447500, device_id, "NiM2", "prmy", 0] (native LE)
-        uint32_t msg[5];
-        msg[0] = 0x03447500;
-        msg[1] = (uint32_t)devices[i].id;
-        msg[2] = 0x4e694d32; // NiM2
-        msg[3] = 0x70726d79; // prmy
-        msg[4] = 0;
-
-        CFDataRef payload = CFDataCreate(NULL, (uint8_t*)msg, 20);
-        CFDataRef reply = NULL;
-
-        SInt32 rc = CFMessagePortSendRequest(bport, 0, payload,
-                                              5.0, 5.0,
-                                              kCFRunLoopDefaultMode,
-                                              &reply);
-        CFRelease(payload);
-
-        CFIndex rlen = reply ? CFDataGetLength(reply) : 0;
-        printf("[test] 0x%04x %-24s → rc=%d reply=%ld bytes",
-               devices[i].id, devices[i].name, (int)rc, (long)rlen);
-
-        if (reply && rlen > 0) {
-            const uint8_t *rb = CFDataGetBytePtr(reply);
-            printf("  [");
-            for (CFIndex j = 0; j < rlen && j < 40; j++)
-                printf("%02x", rb[j]);
-            if (rlen > 40) printf("...");
-            printf("]");
-        }
-        printf("\n");
-        if (reply) CFRelease(reply);
-    }
-    if (bport) CFRelease(bport);
-
-    printf("\n[test] === END PROBE ===\n\n");
-
     // --- Normal handshake ---
     printf("[test] attempting MK1 handshake...\n\n");
 
@@ -171,6 +114,64 @@ int main(int argc, char *argv[])
         printf("[test] device serial: '%s'\n", serial);
     else
         printf("[test] no serial received yet\n");
+
+    // --- Post-handshake probes via request port ---
+    if (ok) {
+        printf("\n[test] === POST-HANDSHAKE PROBES ===\n");
+
+        // Helper to dump a CFDataRef reply
+        #define DUMP_REPLY(label, reply) do { \
+            if (reply && CFDataGetLength(reply) > 0) { \
+                CFIndex _len = CFDataGetLength(reply); \
+                const uint8_t *_b = CFDataGetBytePtr(reply); \
+                printf("[test]   %s: %ld bytes [", label, (long)_len); \
+                for (CFIndex _i = 0; _i < _len && _i < 64; _i++) printf("%02x", _b[_i]); \
+                if (_len > 64) printf("..."); \
+                printf("]\n"); \
+                printf("[test]   ascii: "); \
+                for (CFIndex _i = 0; _i < _len && _i < 64; _i++) \
+                    printf("%c", (_b[_i] >= 0x20 && _b[_i] < 0x7f) ? _b[_i] : '.'); \
+                printf("\n"); \
+                if (_len >= 4) { \
+                    printf("[test]   words:"); \
+                    for (CFIndex _i = 0; _i + 3 < _len; _i += 4) { \
+                        uint32_t _w; memcpy(&_w, _b + _i, 4); \
+                        printf(" 0x%08x", _w); \
+                    } \
+                    printf("\n"); \
+                } \
+            } else { \
+                printf("[test]   %s: (empty)\n", label); \
+            } \
+            if (reply) CFRelease(reply); \
+        } while(0)
+
+        // Probe 1: Device state query (synchronous)
+        {
+            printf("[test] DEVSTATE query...\n");
+            uint32_t msg[1] = { NI_MSG_DEVSTATE };
+            CFDataRef reply = mk1_ipc_query(g_conn, (uint8_t *)msg, sizeof(msg));
+            DUMP_REPLY("devstate", reply);
+        }
+
+        // Probe 2: GetDeviceEnabled
+        {
+            printf("[test] GET_DEVICE_ENABLED query...\n");
+            uint32_t msg[1] = { 0x03446724 };
+            CFDataRef reply = mk1_ipc_query(g_conn, (uint8_t *)msg, sizeof(msg));
+            DUMP_REPLY("enabled", reply);
+        }
+
+        // Probe 3: GetDriverVersion
+        {
+            printf("[test] GET_DRIVER_VERSION query...\n");
+            uint32_t msg[1] = { 0x03446744 };
+            CFDataRef reply = mk1_ipc_query(g_conn, (uint8_t *)msg, sizeof(msg));
+            DUMP_REPLY("driver", reply);
+        }
+
+        printf("[test] === END PROBES ===\n");
+    }
 
     printf("\n[test] listening for further NIHA messages (Ctrl-C to quit)...\n\n");
 

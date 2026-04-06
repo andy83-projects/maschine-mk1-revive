@@ -111,11 +111,15 @@ The `mk1-shim` target builds independently.
 
 ## Status
 
-- [ ] Directory structure and project scaffold
-- [ ] Intel Mac data collection
-- [ ] USB device claim (IOUSBHost)
-- [ ] HID report parsing (mk1-usb)
-- [ ] IPC handshake (mk1-ipc)
-- [ ] Bridge daemon (mk1-bridge)
+- [x] Directory structure and project scaffold
+- [x] Intel Mac data collection (pcap, Frida trace, Ghidra kext RE)
+- [x] USB device claim (IOKit direct, not HID)
+- [x] IPC handshake (full NIHA impersonation including Serial Connect phase)
+- [x] Bridge daemon skeleton (`mk1-bridge`) — Maschine detects MK1 in controller list
+- [x] Display init sequence (EP8, ST7529, 17-command sequence confirmed from pcap)
+- [~] LED forwarding — button LEDs confirmed working; pad LED visibility under test
+- [ ] USB hot-plug (device arrival/removal notifications)
+- [ ] LCD display pixel updates (IPC display message format unconfirmed)
+- [ ] Pad/button/knob input events (USB report format needs decode)
 - [ ] launchd agent plist
 - [ ] End-to-end test with Maschine software

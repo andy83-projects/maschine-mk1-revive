@@ -13,6 +13,9 @@
 		83D596AB2F78EC0D00DA1545 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A62F78EBAD00DA1545 /* IOKit.framework */; };
 		83D596AC2F78EC1500DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
 		83D596BD2F78F3F800DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
+		A1B2C3D42F79000100DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
+		B1C2D3E42F79000200DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
+		B1C2D3E52F79000200DA1545 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A62F78EBAD00DA1545 /* IOKit.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -34,9 +37,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 1;
 		};
+		A1B2C3D82F79000100DA1545 /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = /usr/share/man/man1/;
+			dstSubfolderSpec = 0;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 1;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		836DEFD52F807F1000D2091E /* mk1_ipc_sniffer.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mk1_ipc_sniffer.c; sourceTree = "<group>"; };
+		836DEFD62F807F7A00D2091E /* run-maschine-with-sniffer.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "run-maschine-with-sniffer.sh"; sourceTree = "<group>"; };
 		83D596602F78E76100DA1545 /* libmk1-usb.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libmk1-usb.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		83D596682F78E77B00DA1545 /* libmk1-ipc.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libmk1-ipc.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		83D596702F78E7B900DA1545 /* mk1-bridge */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "mk1-bridge"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -44,6 +58,8 @@
 		83D596A62F78EBAD00DA1545 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		83D596A82F78EBB800DA1545 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		83D596B12F78F34700DA1545 /* mk1-ipc-test */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "mk1-ipc-test"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1B2C3D52F79000100DA1545 /* mk1-trace */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "mk1-trace"; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1C2D3E62F79000200DA1545 /* libmk1-call-logger.dylib */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.dylib"; includeInIndex = 0; path = "libmk1-call-logger.dylib"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -83,6 +99,16 @@
 		83D596B92F78F36100DA1545 /* mk1-ipc-test */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "mk1-ipc-test";
+			sourceTree = "<group>";
+		};
+		A1B2C3D62F79000100DA1545 /* mk1-trace */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "mk1-trace";
+			sourceTree = "<group>";
+		};
+		B1C2D3E72F79000200DA1545 /* mk1-call-logger */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "mk1-call-logger";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -129,19 +155,48 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A1B2C3D72F79000100DA1545 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1B2C3D42F79000100DA1545 /* CoreFoundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B1C2D3E82F79000200DA1545 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1C2D3E42F79000200DA1545 /* CoreFoundation.framework in Frameworks */,
+				B1C2D3E52F79000200DA1545 /* IOKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		836DEFD42F807EDC00D2091E /* mk1-ipc-sniffer */ = {
+			isa = PBXGroup;
+			children = (
+				836DEFD52F807F1000D2091E /* mk1_ipc_sniffer.c */,
+				836DEFD62F807F7A00D2091E /* run-maschine-with-sniffer.sh */,
+			);
+			path = "mk1-ipc-sniffer";
+			sourceTree = "<group>";
+		};
 		83D5964B2F78E58900DA1545 = {
 			isa = PBXGroup;
 			children = (
 				83D596B92F78F36100DA1545 /* mk1-ipc-test */,
+				A1B2C3D62F79000100DA1545 /* mk1-trace */,
+				B1C2D3E72F79000200DA1545 /* mk1-call-logger */,
 				83D596A02F78E96000DA1545 /* mk1-usb */,
 				83D5969D2F78E94C00DA1545 /* mk1-shim */,
 				83D5969A2F78E93300DA1545 /* mk1-ipc */,
 				83D596952F78E92000DA1545 /* mk1-bridge */,
 				83D596A52F78EBAD00DA1545 /* Frameworks */,
 				83D596552F78E58900DA1545 /* Products */,
+				836DEFD42F807EDC00D2091E /* mk1-ipc-sniffer */,
 			);
 			sourceTree = "<group>";
 		};
@@ -153,6 +208,8 @@
 				83D596702F78E7B900DA1545 /* mk1-bridge */,
 				83D5967C2F78E80200DA1545 /* libmk1-shim.dylib */,
 				83D596B12F78F34700DA1545 /* mk1-ipc-test */,
+				A1B2C3D52F79000100DA1545 /* mk1-trace */,
+				B1C2D3E62F79000200DA1545 /* libmk1-call-logger.dylib */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -184,6 +241,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		83D596782F78E80200DA1545 /* Headers */ = {
+			isa = PBXHeadersBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B1C2D3EB2F79000200DA1545 /* Headers */ = {
 			isa = PBXHeadersBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -249,6 +313,7 @@
 			fileSystemSynchronizedGroups = (
 				83D596952F78E92000DA1545 /* mk1-bridge */,
 				83D5969A2F78E93300DA1545 /* mk1-ipc */,
+				83D596A02F78E96000DA1545 /* mk1-usb */,
 			);
 			name = "mk1-bridge";
 			packageProductDependencies = (
@@ -301,6 +366,50 @@
 			productReference = 83D596B12F78F34700DA1545 /* mk1-ipc-test */;
 			productType = "com.apple.product-type.tool";
 		};
+		A1B2C3D92F79000100DA1545 /* mk1-trace */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A1B2C3E12F79000100DA1545 /* Build configuration list for PBXNativeTarget "mk1-trace" */;
+			buildPhases = (
+				A1B2C3DA2F79000100DA1545 /* Sources */,
+				A1B2C3D72F79000100DA1545 /* Frameworks */,
+				A1B2C3D82F79000100DA1545 /* CopyFiles */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A1B2C3D62F79000100DA1545 /* mk1-trace */,
+			);
+			name = "mk1-trace";
+			packageProductDependencies = (
+			);
+			productName = "mk1-trace";
+			productReference = A1B2C3D52F79000100DA1545 /* mk1-trace */;
+			productType = "com.apple.product-type.tool";
+		};
+		B1C2D3EA2F79000200DA1545 /* mk1-call-logger */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B1C2D3F32F79000200DA1545 /* Build configuration list for PBXNativeTarget "mk1-call-logger" */;
+			buildPhases = (
+				B1C2D3EB2F79000200DA1545 /* Headers */,
+				B1C2D3EC2F79000200DA1545 /* Sources */,
+				B1C2D3E82F79000200DA1545 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				B1C2D3E72F79000200DA1545 /* mk1-call-logger */,
+			);
+			name = "mk1-call-logger";
+			packageProductDependencies = (
+			);
+			productName = "mk1-call-logger";
+			productReference = B1C2D3E62F79000200DA1545 /* libmk1-call-logger.dylib */;
+			productType = "com.apple.product-type.library.dynamic";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -325,6 +434,12 @@
 					83D596B02F78F34700DA1545 = {
 						CreatedOnToolsVersion = 26.4;
 					};
+					A1B2C3D92F79000100DA1545 = {
+						CreatedOnToolsVersion = 26.4;
+					};
+					B1C2D3EA2F79000200DA1545 = {
+						CreatedOnToolsVersion = 26.4;
+					};
 				};
 			};
 			buildConfigurationList = 83D5964F2F78E58900DA1545 /* Build configuration list for PBXProject "maschine-mk1-revive" */;
@@ -346,6 +461,8 @@
 				83D5966F2F78E7B900DA1545 /* mk1-bridge */,
 				83D5967B2F78E80200DA1545 /* mk1-shim */,
 				83D596B02F78F34700DA1545 /* mk1-ipc-test */,
+				A1B2C3D92F79000100DA1545 /* mk1-trace */,
+				B1C2D3EA2F79000200DA1545 /* mk1-call-logger */,
 			);
 		};
 /* End PBXProject section */
@@ -380,6 +497,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		83D596AD2F78F34700DA1545 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A1B2C3DA2F79000100DA1545 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B1C2D3EC2F79000200DA1545 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -620,6 +751,70 @@
 			};
 			name = Release;
 		};
+		A1B2C3DF2F79000100DA1545 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = x86_64;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 743HVY2AQU;
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				OTHER_CFLAGS = (
+					"$(inherited)",
+					"-fblocks",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		A1B2C3E02F79000100DA1545 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = x86_64;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 743HVY2AQU;
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				OTHER_CFLAGS = (
+					"$(inherited)",
+					"-fblocks",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+		B1C2D3F12F79000200DA1545 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = x86_64;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 743HVY2AQU;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				EXECUTABLE_PREFIX = lib;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				OTHER_LDFLAGS = "\"-undefined dynamic_lookup\"";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		B1C2D3F22F79000200DA1545 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = x86_64;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 743HVY2AQU;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				EXECUTABLE_PREFIX = lib;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				OTHER_LDFLAGS = "\"-undefined dynamic_lookup\"";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -673,6 +868,24 @@
 			buildConfigurations = (
 				83D596B62F78F34700DA1545 /* Debug */,
 				83D596B72F78F34700DA1545 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A1B2C3E12F79000100DA1545 /* Build configuration list for PBXNativeTarget "mk1-trace" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1B2C3DF2F79000100DA1545 /* Debug */,
+				A1B2C3E02F79000100DA1545 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B1C2D3F32F79000200DA1545 /* Build configuration list for PBXNativeTarget "mk1-call-logger" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B1C2D3F12F79000200DA1545 /* Debug */,
+				B1C2D3F22F79000200DA1545 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

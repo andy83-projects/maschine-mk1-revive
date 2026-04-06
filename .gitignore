@@ -5,3 +5,12 @@ build/
 DerivedData/
 *.xcuserstate
 xcuserdata/
+
+# Capture data and binaries — do not commit
+usb.pcapng
+ep*.txt
+trace/
+NIUSBMaschineController.kext/
+MASCHINE_2.0_MK1_2.7.6_0518_Manual_English.pdf
+znilcjyseuwhvfgcws5p.jpg
+mk1-trace/oldmac:~

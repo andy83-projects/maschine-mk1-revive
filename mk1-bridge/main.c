@@ -408,11 +408,7 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
 
     BTNLOG("button event len=%zu", ev->len);
 
-    uint8_t buf[4 + ev->len];
-    uint32_t type = NI_EVT_BTN_DATA;
-    memcpy(buf, &type, 4);
-    memcpy(buf + 4, ev->raw, ev->len);
-    mk1_server_send_event(br->srv, buf, 4 + ev->len);
+    mk1_server_send_event(br->srv, ev->raw, ev->len);
 }
 
 // ---------------------------------------------------------------------------

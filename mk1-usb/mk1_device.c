@@ -8,7 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "../mk1-ipc/mk1_ipc.h"
 
 #define MK1_INTERFACE_NUMBER    0
 #define MK1_ALTERNATE_SETTING   1
@@ -65,9 +68,14 @@ struct mk1_device {
     void                    *cb_context;
     bool                     trace_reports;
     bool                     trace_scan_reports;
+    bool                     trace_all_pipes;
     bool                     scan_baseline_set;
     size_t                   scan_baseline_len;
     uint8_t                  scan_baseline[64];
+    bool                     ep1_short_report_valid;
+    uint8_t                  ep1_short_report[8];
+    bool                     ep1_33_autowrite_pressed;
+    bool                     ep1_33_sampling_pressed;
 
     // Pad calibration: first EP4 report is captured as baseline.
     // Pressure is reported as delta above baseline, clamped to 0-4095.
@@ -736,6 +744,284 @@ static void log_scan_report(mk1_pipe_reader_t *reader, const uint8_t *data, size
     }
 }
 
+static void log_ep1_packet_diff(mk1_pipe_reader_t *reader,
+                                const uint8_t *previous,
+                                size_t previous_len,
+                                const uint8_t *current,
+                                size_t current_len)
+{
+    size_t shared_len = previous_len < current_len ? previous_len : current_len;
+    size_t diff_count = 0;
+    size_t preview_count = 0;
+    uint8_t diff_preview[16] = {0};
+
+    for (size_t i = 0; i < shared_len; i++) {
+        if (previous[i] != current[i]) {
+            diff_count++;
+            if (preview_count < sizeof(diff_preview)) {
+                diff_preview[preview_count++] = (uint8_t)i;
+            }
+        }
+    }
+
+    if (previous_len != current_len) {
+        diff_count += previous_len > current_len ? (previous_len - shared_len) : (current_len - shared_len);
+    }
+
+    if (diff_count == 0) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[mk1-usb] EP1-in changed pipe=%u len=%zu diff=%zu",
+            reader ? reader->pipe_ref : 0,
+            current_len,
+            diff_count);
+    if (current_len >= 8) {
+        fprintf(stderr,
+                " b0=%02x b4=%02x b5=%02x b6=%02x b7=%02x",
+                current[0],
+                current[4],
+                current[5],
+                current[6],
+                current[7]);
+    }
+    fprintf(stderr, "\n");
+
+    if (preview_count > 0) {
+        fprintf(stderr, "[mk1-usb] EP1-in diff bytes:");
+        for (size_t i = 0; i < preview_count; i++) {
+            size_t index = diff_preview[i];
+            fprintf(stderr, " %zu(%02x->%02x)", index, previous[index], current[index]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    log_short_bytes("EP1-in payload", current, current_len, 64);
+}
+
+static void log_all_pipe_report(mk1_pipe_reader_t *reader, const uint8_t *data, size_t len)
+{
+    mk1_device_t *dev = reader ? reader->device : NULL;
+    bool changed = !reader || !reader->have_last_report || reader->last_report_len != len;
+
+    if (!dev || !dev->trace_all_pipes) {
+        return;
+    }
+
+    // The useful unexplained traffic is currently EP1-in short replies.
+    // Ignore the rest here so button runs stay readable.
+    if (!reader || reader->endpoint_number != 1 || (len != 8 && len != 33)) {
+        return;
+    }
+
+    if (!changed && data) {
+        changed = memcmp(reader->last_report, data, len) != 0;
+    }
+
+    if (!reader->have_last_report || reader->last_report_len != len) {
+        fprintf(stderr,
+                "[mk1-usb] EP1-in baseline pipe=%u len=%zu\n",
+                reader->pipe_ref,
+                len);
+        log_short_bytes("EP1-in payload", data, len, 64);
+    } else if (changed) {
+        log_ep1_packet_diff(reader,
+                            reader->last_report,
+                            reader->last_report_len,
+                            data,
+                            len);
+    }
+
+    if (len > sizeof(reader->last_report)) {
+        len = sizeof(reader->last_report);
+    }
+    memcpy(reader->last_report, data, len);
+    reader->last_report_len = len;
+    reader->have_last_report = true;
+}
+
+static void store_u32_le(uint8_t *dst, uint32_t value)
+{
+    if (!dst) return;
+    memcpy(dst, &value, sizeof(value));
+}
+
+static uint64_t mk1_current_timestamp_ns(void)
+{
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_UPTIME_RAW, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void mk1_emit_button_event(mk1_device_t *dev,
+                                  const char *label,
+                                  uint32_t control_index,
+                                  bool pressed)
+{
+    if (!dev || !dev->button_cb) {
+        return;
+    }
+
+    mk1_button_event_t event = {0};
+    event.len = 6 * sizeof(uint32_t);
+    uint8_t *cursor = event.raw;
+
+    store_u32_le(cursor + 0 * 4, NI_EVT_BTN_DATA);
+    uint64_t timestamp = mk1_current_timestamp_ns();
+    store_u32_le(cursor + 1 * 4, (uint32_t)(timestamp >> 32));
+    store_u32_le(cursor + 2 * 4, (uint32_t)(timestamp & 0xffffffffu));
+    store_u32_le(cursor + 3 * 4, 0x00000001);
+    store_u32_le(cursor + 4 * 4, control_index);
+    store_u32_le(cursor + 5 * 4, pressed ? 1 : 0);
+
+    if (dev->trace_all_pipes) {
+        fprintf(stderr,
+                "[mk1-usb] btn evt %s idx=0x%02x %s\n",
+                label ? label : "unknown",
+                control_index,
+                pressed ? "press" : "release");
+    }
+
+    dev->button_cb(&event, dev->cb_context);
+}
+
+static void mk1_process_ep1_short_buttons(mk1_device_t *dev, const uint8_t *new_report)
+{
+    // EP1 short reports carry several independent button banks across different bytes.
+    // The mappings below mix two sources:
+    // 1. raw Apple Silicon EP1 bit positions
+    // 2. observed Maschine behavior for the currently-working BTN_DATA path
+    //
+    // Several Intel control_index assumptions were off by one bank during earlier
+    // correlation work. The Group row is corrected here to match the actions seen
+    // in Maschine itself.
+    static const struct {
+        uint8_t byte_index;
+        uint8_t bit;
+        uint32_t control_index;
+        const char *name;
+    } button_map[] = {
+        { 4, 0x01, 0x18, "Control" },
+        { 4, 0x02, 0x19, "Browse" },
+        { 4, 0x04, 0x1a, "Left" },
+        { 4, 0x08, 0x1b, "Snap" },
+        { 4, 0x20, 0x1d, "Right" },
+        { 4, 0x80, 0x1f, "Step" },
+        { 3, 0x80, 0x17, "Group A" },
+        { 3, 0x40, 0x16, "Group B" },
+        { 3, 0x20, 0x15, "Group C" },
+        { 3, 0x10, 0x14, "Group D" },
+        { 3, 0x01, 0x10, "Group E" },
+        { 3, 0x02, 0x11, "Group F" },
+        { 3, 0x04, 0x12, "Group G" },
+        { 3, 0x08, 0x13, "Group H" },
+        { 2, 0x80, 0x0f, "Restart" },
+        { 2, 0x40, 0x0e, "Transport Left" },
+        { 2, 0x20, 0x0d, "Transport Right" },
+        { 2, 0x10, 0x0c, "Grid" },
+        { 6, 0x02, 0x29, "Play" },
+        { 2, 0x02, 0x09, "Record" },
+        // TODO: Revisit Erase. Raw EP1 mask and Intel control_index are confirmed,
+        // but Maschine behavior still appears uncertain in live testing.
+        { 2, 0x04, 0x0a, "Erase" },
+        { 2, 0x08, 0x0b, "Shift" },
+    };
+
+    if (!dev || !new_report) {
+        return;
+    }
+
+    if (!dev->ep1_short_report_valid) {
+        dev->ep1_short_report_valid = true;
+        memcpy(dev->ep1_short_report, new_report, sizeof(dev->ep1_short_report));
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(button_map) / sizeof(button_map[0]); i++) {
+        uint8_t byte_index = button_map[i].byte_index;
+        if (byte_index >= sizeof(dev->ep1_short_report)) {
+            continue;
+        }
+
+        uint8_t previous = dev->ep1_short_report[byte_index];
+        uint8_t current = new_report[byte_index];
+        uint8_t changed = previous ^ current;
+        if ((changed & button_map[i].bit) == 0) continue;
+
+        bool pressed = (current & button_map[i].bit) != 0;
+        mk1_emit_button_event(dev, button_map[i].name, button_map[i].control_index, pressed);
+    }
+
+    memcpy(dev->ep1_short_report, new_report, sizeof(dev->ep1_short_report));
+}
+
+static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data)
+{
+    if (!dev || !data) {
+        return;
+    }
+
+    uint8_t br = data[4];
+    uint8_t high_nibble = br & 0xf0;
+    // Observed traces: Auto Write pulses show a 0x7x high nibble, Sampling pulses appear as 0x6x,
+    // and the shared release state resides in the 0x5x range.  We emit NI BTN_DATA events
+    // whenever we cross those boundaries.
+
+    if (high_nibble == 0x70) {
+        if (!dev->ep1_33_autowrite_pressed) {
+            dev->ep1_33_autowrite_pressed = true;
+            dev->ep1_33_sampling_pressed = false;
+            mk1_emit_button_event(dev, "Auto Write", 0x1c, true);
+        }
+        return;
+    }
+
+    if (high_nibble == 0x60) {
+        if (!dev->ep1_33_sampling_pressed) {
+            dev->ep1_33_sampling_pressed = true;
+            dev->ep1_33_autowrite_pressed = false;
+            mk1_emit_button_event(dev, "Sampling", 0x1e, true);
+        }
+        return;
+    }
+
+    if (high_nibble == 0x50) {
+        if (dev->ep1_33_autowrite_pressed) {
+            dev->ep1_33_autowrite_pressed = false;
+            mk1_emit_button_event(dev, "Auto Write", 0x1c, false);
+        }
+        if (dev->ep1_33_sampling_pressed) {
+            dev->ep1_33_sampling_pressed = false;
+            mk1_emit_button_event(dev, "Sampling", 0x1e, false);
+        }
+    }
+}
+
+static void mk1_device_process_ep1_button_packet(mk1_device_t *dev,
+                                                mk1_pipe_reader_t *reader,
+                                                const uint8_t *data,
+                                                size_t len)
+{
+    (void)reader;
+
+    if (!dev || !data || len == 0) {
+        return;
+    }
+
+    if (len == 8 && data[0] == 0x04) {
+        mk1_process_ep1_short_buttons(dev, data);
+        return;
+    }
+
+    if (len == 33 && data[0] == 0x02) {
+        mk1_process_ep1_len33_buttons(dev, data);
+        return;
+    }
+}
+
 static bool get_pipe_endpoint_number(const mk1_device_t *dev,
                                      UInt8 pipe_ref,
                                      UInt8 *endpoint_number)
@@ -1375,7 +1661,9 @@ static void *read_thread_main(void *context)
             continue;
         }
 
+        log_all_pipe_report(reader, buffer, size);
         if (reader->endpoint_number == 1) {
+            mk1_device_process_ep1_button_packet(dev, reader, buffer, size);
             mk1_device_handle_ep1_reply(dev, buffer, size);
             continue;
         }
@@ -1393,6 +1681,7 @@ mk1_device_t *mk1_device_open(void)
     if (!dev) return NULL;
     dev->trace_reports = env_flag_enabled("MK1_USB_TRACE");
     dev->trace_scan_reports = env_flag_enabled("MK1_SCAN_TRACE");
+    dev->trace_all_pipes = env_flag_enabled("MK1_ALL_PIPE_TRACE");
     pthread_mutex_init(&dev->reply_lock, NULL);
 
     dev->service = find_matching_usb_service(dev->serial, sizeof(dev->serial));
@@ -1414,6 +1703,9 @@ mk1_device_t *mk1_device_open(void)
     }
     if (dev->trace_scan_reports) {
         fprintf(stderr, "[mk1-usb] scan-frame tracing enabled via MK1_SCAN_TRACE\n");
+    }
+    if (dev->trace_all_pipes) {
+        fprintf(stderr, "[mk1-usb] all-pipe tracing enabled via MK1_ALL_PIPE_TRACE\n");
     }
     log_service_path(dev->service, kIOServicePlane, "device");
     log_service_path(dev->service, kIOUSBPlane, "device");

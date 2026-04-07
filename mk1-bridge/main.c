@@ -94,27 +94,48 @@ static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRun
 // ---------------------------------------------------------------------------
 // Display: IPC -> USB
 //
-// IPC DISPLAY message layout (validated from bridge logs / sniffer):
-//   [0..3]   cmd_type     (NI_CMD_DISPLAY)
-//   [4..7]   flags/index  (low byte = 0 left, 1 right; upper bits observed 0x10000000)
-//   [8..11]  frame/page   (observed 0 or 1)
-//   [12..15] format/flags (observed 0x00ff0040 or 0x00ff003c)
-//   [16..19] pixelDataLen (4 bytes, LE)
-//   [20+]    pixelData    (8bpp grayscale)
+// IPC DISPLAY message layout (confirmed from Macchina RE + bridge logs):
+//   [0..3]   cmd_type   (NI_CMD_DISPLAY = 0x03647344)
+//   [4..7]   dispn      (byte[4]: 0=left, 1=right; byte[7]: 0x10 flag)
+//   [8..9]   y          (LE uint16, row origin of update region)
+//   [10..11] x          (LE uint16, always 0 observed)
+//   [12..13] h          (LE uint16, height of update region in rows)
+//   [14..15] w          (LE uint16, logical pixel width; always 255 observed)
+//   [16..19] pixel_len  (LE uint32, byte count of encoded pixel data)
+//   [20+]    pixel_data (ST7529-encoded: 3 logical pixels → 2 bytes, 5 bits/pixel)
+//
+// Pixel encoding (from Macchina NIImageConversions NI24BPPToST7529Data):
+//   Every group of 3 pixels packs into 2 bytes:
+//     byte[0] = px0<<3 | px1>>2
+//     byte[1] = px1<<6 | px2
+//   where each pxN is a 5-bit grayscale value (0x00=black, 0x1F=white).
+//   e.g. 3 white pixels → 0xFF 0xDF; full-white row (255px) = 170 bytes.
+//   Full frame: 255 × 64 × (2/3) = 10,880 bytes → 170 bytes/row on hardware.
+//
+// Partial update strategy:
+//   Maschine sends partial updates with y≠0 or h<64. RAMWR always resets the
+//   write pointer to the start of the ST7529 address window (row 0), so writing
+//   partial data directly shifts content up by y rows. Fix: composite each
+//   update into a per-display framebuffer at the correct y offset, then always
+//   send the full 10,880-byte frame so the write pointer is always at row 0.
 //
 // USB EP8 framebuffer format (from usb.pcapng):
-//   First byte of payload is 0x5c (ST7529 RAMWR command).
-//   Remaining bytes are pixel data as-is (already 8bpp grayscale).
-//   Chunked at 508 bytes via mk1_set_display():
+//   Payload: [0x5c (ST7529 RAMWR), <10880 pixel bytes>], chunked at 508 bytes:
 //     chunk 0: display_idx=base,      508 bytes = [0x5c, <507 px>]
 //     chunk N: display_idx=base|0x01, 508 bytes = [<508 px>]
-//     last:    display_idx=base|0x01, <remainder bytes>
+//     last:    display_idx=base|0x01, <remainder>
 // ---------------------------------------------------------------------------
 
-#define IPC_DISPLAY_HDR_LEN   20
-#define EP8_CHUNK_MAX         508
-#define ST7529_RAMWR          0x5c
+#define IPC_DISPLAY_HDR_LEN      20
+#define EP8_CHUNK_MAX            508
+#define ST7529_RAMWR             0x5c
+#define DISPLAY_ROWS             64
+#define DISPLAY_BYTES_PER_ROW    170    // 255 logical px × (2/3) bytes/px
+#define DISPLAY_FB_BYTES         10880  // DISPLAY_ROWS × DISPLAY_BYTES_PER_ROW
+#define DISPLAY_COUNT            2
 
+// Per-display framebuffers — composited here, full frame always sent to hardware.
+static uint8_t g_display_fb[DISPLAY_COUNT][DISPLAY_FB_BYTES];
 
 static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 {
@@ -123,57 +144,72 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
         return;
     }
 
-    // Hex dump first 32 bytes so we can verify the header layout
-    char hex[32 * 3 + 1];
-    size_t dump_n = raw_len < 32 ? raw_len : 32;
-    for (size_t i = 0; i < dump_n; i++) snprintf(hex + i*3, 4, "%02x ", raw_msg[i]);
-    hex[dump_n * 3] = '\0';
-    DLOG("raw (%zu): %s", raw_len, hex);
-
     if (raw_len < IPC_DISPLAY_HDR_LEN + 1) {
         DLOG("too short (%zu)", raw_len);
         return;
     }
 
-    uint8_t ipc_idx = raw_msg[4];
+    uint8_t  disp_idx = raw_msg[4] & 0x01;   // 0=left, 1=right
+    uint16_t y, h;
     uint32_t pixel_len;
+    memcpy(&y,         raw_msg + 8,  2);
+    memcpy(&h,         raw_msg + 12, 2);
     memcpy(&pixel_len, raw_msg + 16, 4);
 
+    if (h == 0 || (uint32_t)y + h > DISPLAY_ROWS) {
+        DLOG("disp=%u bad y=%u h=%u", disp_idx, y, h);
+        return;
+    }
     if (pixel_len == 0 || (size_t)(IPC_DISPLAY_HDR_LEN + pixel_len) > raw_len) {
-        DLOG("bad pixel_len=%u raw_len=%zu", pixel_len, raw_len);
+        DLOG("disp=%u bad pixel_len=%u raw_len=%zu", disp_idx, pixel_len, raw_len);
         return;
     }
 
+    size_t bytes_per_row = pixel_len / h;
+    if (bytes_per_row == 0 || bytes_per_row > DISPLAY_BYTES_PER_ROW) {
+        DLOG("disp=%u unexpected bytes_per_row=%zu (pixel_len=%u h=%u)",
+             disp_idx, bytes_per_row, pixel_len, h);
+        return;
+    }
+
+    DLOG("disp=%u y=%u h=%u bytes_per_row=%zu pixel_len=%u",
+         disp_idx, y, h, bytes_per_row, pixel_len);
+
+    // Composite update region into the local framebuffer.
     const uint8_t *pixels = raw_msg + IPC_DISPLAY_HDR_LEN;
-    uint8_t usb_base = (uint8_t)(ipc_idx * 2);   // IPC 0=left(0x00), 1=right(0x02)
+    for (uint16_t r = 0; r < h; r++) {
+        memcpy(g_display_fb[disp_idx] + (y + r) * DISPLAY_BYTES_PER_ROW,
+               pixels + r * bytes_per_row,
+               bytes_per_row);
+    }
 
-    DLOG("ipc_idx=%u -> usb_base=0x%02x pixel_len=%u", ipc_idx, usb_base, pixel_len);
+    // Send full framebuffer: [0x5c, <10880 bytes>], chunked at 508.
+    // RAMWR resets the ST7529 write pointer to the start of the address window,
+    // so always sending the full frame keeps the pointer anchored at row 0.
+    uint8_t usb_base = disp_idx == 0 ? 0x00 : 0x02;
+    uint8_t *frame = malloc(1 + DISPLAY_FB_BYTES);
+    if (!frame) return;
+    frame[0] = ST7529_RAMWR;
+    memcpy(frame + 1, g_display_fb[disp_idx], DISPLAY_FB_BYTES);
 
-    // Build framebuffer: [0x5c, <pixel_data>]
-    size_t fb_len = 1 + pixel_len;
-    uint8_t *fb = malloc(fb_len);
-    if (!fb) return;
-    fb[0] = ST7529_RAMWR;
-    memcpy(fb + 1, pixels, pixel_len);
-
-    size_t remaining = fb_len;
+    size_t total = 1 + DISPLAY_FB_BYTES;
     size_t offset = 0;
     bool ok = true;
 
-    while (remaining > 0 && ok) {
-        size_t chunk = remaining > EP8_CHUNK_MAX ? EP8_CHUNK_MAX : remaining;
+    while (offset < total && ok) {
+        size_t chunk = (total - offset) > EP8_CHUNK_MAX
+                     ? EP8_CHUNK_MAX : (total - offset);
         uint8_t disp = (offset == 0) ? usb_base : (uint8_t)(usb_base | 0x01);
-        ok = mk1_set_display(br->usb, disp, fb + offset, chunk);
+        ok = mk1_set_display(br->usb, disp, frame + offset, chunk);
         offset += chunk;
-        remaining -= chunk;
     }
 
-    free(fb);
+    free(frame);
 
     if (!ok) {
         DLOG("EP8 write failed");
     } else {
-        DLOG("sent %zu bytes to display %u OK", fb_len, usb_base);
+        DLOG("sent full frame (%d bytes) to display %u OK", 1 + DISPLAY_FB_BYTES, usb_base);
     }
 }
 

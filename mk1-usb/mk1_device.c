@@ -76,6 +76,8 @@ struct mk1_device {
     uint8_t                  ep1_short_report[8];
     bool                     ep1_33_autowrite_pressed;
     bool                     ep1_33_sampling_pressed;
+    bool                     ep1_len33_prev_valid;
+    uint8_t                  ep1_len33_prev[33];
 
     // Pad calibration: first EP4 report is captured as baseline.
     // Pressure is reported as delta above baseline, clamped to 0-4095.
@@ -888,6 +890,46 @@ static void mk1_emit_button_event(mk1_device_t *dev,
     dev->button_cb(&event, dev->cb_context);
 }
 
+static int8_t mk1_wrapped_u8_delta(uint8_t previous, uint8_t current)
+{
+    int delta = (int)current - (int)previous;
+    if (delta > 127) delta -= 256;
+    if (delta < -127) delta += 256;
+    return (int8_t)delta;
+}
+
+static void mk1_emit_knob_event(mk1_device_t *dev,
+                                const char *label,
+                                uint32_t encoder_index,
+                                float delta)
+{
+    if (!dev || !dev->button_cb || delta == 0.0f) {
+        return;
+    }
+
+    mk1_button_event_t event = {0};
+    event.len = 6 * sizeof(uint32_t);
+    uint8_t *cursor = event.raw;
+
+    store_u32_le(cursor + 0 * 4, NI_EVT_KNOB_ROTATE);
+    uint64_t timestamp = mk1_current_timestamp_ns();
+    store_u32_le(cursor + 1 * 4, (uint32_t)(timestamp >> 32));
+    store_u32_le(cursor + 2 * 4, (uint32_t)(timestamp & 0xffffffffu));
+    store_u32_le(cursor + 3 * 4, 0x00000001);
+    store_u32_le(cursor + 4 * 4, encoder_index);
+    memcpy(cursor + 5 * 4, &delta, sizeof(delta));
+
+    if (dev->trace_all_pipes) {
+        fprintf(stderr,
+                "[mk1-usb] knob evt %s idx=%u delta=%.4f\n",
+                label ? label : "unknown",
+                encoder_index,
+                (double)delta);
+    }
+
+    dev->button_cb(&event, dev->cb_context);
+}
+
 static void mk1_process_ep1_short_buttons(mk1_device_t *dev, const uint8_t *new_report)
 {
     // EP1 short reports carry several independent button banks across different bytes.
@@ -904,6 +946,15 @@ static void mk1_process_ep1_short_buttons(mk1_device_t *dev, const uint8_t *new_
         uint32_t control_index;
         const char *name;
     } button_map[] = {
+        // Pad section (byte 1, confirmed from Apple Silicon EP1 traces + Intel IPC capture 2026-04-07)
+        { 1, 0x80, 0x07, "Scene" },
+        { 1, 0x40, 0x06, "Pattern" },
+        { 1, 0x20, 0x05, "Pad Mode" },
+        { 1, 0x10, 0x04, "Navigate" },
+        { 1, 0x08, 0x03, "Duplicate" },
+        { 1, 0x04, 0x02, "Select" },
+        { 1, 0x02, 0x01, "Solo" },
+        { 1, 0x01, 0x00, "Mute" },
         { 4, 0x01, 0x18, "Control" },
         { 4, 0x02, 0x19, "Browse" },
         { 4, 0x04, 0x1a, "Left" },
@@ -922,6 +973,16 @@ static void mk1_process_ep1_short_buttons(mk1_device_t *dev, const uint8_t *new_
         { 2, 0x40, 0x0e, "Transport Left" },
         { 2, 0x20, 0x0d, "Transport Right" },
         { 2, 0x10, 0x0c, "Grid" },
+        // Screen buttons (byte 5, confirmed from Apple Silicon EP1 traces + Intel IPC capture 2026-04-07)
+        { 5, 0x80, 0x27, "Screen 1" },
+        { 5, 0x40, 0x26, "Screen 2" },
+        { 5, 0x20, 0x25, "Screen 3" },
+        { 5, 0x10, 0x24, "Screen 4" },
+        { 5, 0x08, 0x23, "Screen 5" },
+        { 5, 0x04, 0x22, "Screen 6" },
+        { 5, 0x02, 0x21, "Screen 7" },
+        { 5, 0x01, 0x20, "Screen 8" },
+        { 6, 0x01, 0x28, "Note Repeat" },
         { 6, 0x02, 0x29, "Play" },
         { 2, 0x02, 0x09, "Record" },
         // TODO: Revisit Erase. Raw EP1 mask and Intel control_index are confirmed,
@@ -964,6 +1025,42 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         return;
     }
 
+    static const struct {
+        uint8_t byte_a;
+        uint8_t byte_b;
+        uint32_t encoder_index;
+        const char *name;
+    } knob_map[] = {
+        // Byte positions come from Apple Silicon USB traces; encoder indexes are
+        // confirmed by the dedicated Intel Volume/Tempo/Swing capture.
+        { 17, 18, 0, "Volume" },
+        { 11, 12, 1, "Tempo" },
+        {  5,  6, 2, "Swing" },
+    };
+
+    for (size_t i = 0; i < sizeof(knob_map) / sizeof(knob_map[0]); i++) {
+        uint8_t prev_a = dev->ep1_len33_prev[knob_map[i].byte_a];
+        uint8_t curr_a = data[knob_map[i].byte_a];
+        uint8_t prev_b = dev->ep1_len33_prev[knob_map[i].byte_b];
+        uint8_t curr_b = data[knob_map[i].byte_b];
+
+        if (prev_a == 0 && prev_b == 0 && !dev->ep1_len33_prev_valid) {
+            continue;
+        }
+
+        int8_t delta_primary = mk1_wrapped_u8_delta(prev_a, curr_a);
+        int8_t delta_secondary = mk1_wrapped_u8_delta(prev_b, curr_b);
+        int8_t chosen_delta = delta_primary;
+        if (chosen_delta == 0) {
+            chosen_delta = delta_secondary;
+        }
+
+        if (chosen_delta != 0) {
+            float normalized = (float)chosen_delta / 255.0f;
+            mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
+        }
+    }
+
     uint8_t br = data[4];
     uint8_t high_nibble = br & 0xf0;
     // Observed traces: Auto Write pulses show a 0x7x high nibble, Sampling pulses appear as 0x6x,
@@ -998,6 +1095,9 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
             mk1_emit_button_event(dev, "Sampling", 0x1e, false);
         }
     }
+
+    memcpy(dev->ep1_len33_prev, data, sizeof(dev->ep1_len33_prev));
+    dev->ep1_len33_prev_valid = true;
 }
 
 static void mk1_device_process_ep1_button_packet(mk1_device_t *dev,

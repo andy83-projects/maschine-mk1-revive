@@ -305,14 +305,28 @@ xcodebuild -project maschine-mk1-revive.xcodeproj -scheme mk1-bridge -configurat
 - `mk1-usb/mk1_device.h` — display constants, selector enum
 - `mk1-ipc/mk1_ipc.h` — all IPC message type constants
 - `mk1-ipc/mk1_ipc.c` — CFMessagePort server/client
-- `mk1-bridge/main.c` — bridge entry point; `forward_led` stub needs implementation
+- `mk1-bridge/main.c` — bridge entry point; `forward_display` and `forward_led` implemented
 - `mk1-bridge/mk1_server.c` — NIHA impersonation server (full handshake)
 - `mk1-shim/mk1_shim.c` — reference: `mk1_shim_remap_led_payload` at ~line 400
 - `docs/PLAN.md` — implementation roadmap with confidence levels
 
+## Known open issue: display backlight toggles on button presses
+
+Both displays simultaneously go dark for ~1 frame when screen-area or group buttons are
+pressed (view transitions). Pixel content is preserved — only the physical backlight LED
+toggles. Confirmed NOT caused by: `0xaf` re-assertion after RAMWR, all-black frame skipping,
+phys[1] forcing in DIMM_LEDS, `0x30` before address window. See `docs/HANDOFF-2026-04-08.md`
+for full diagnosis and leading hypotheses.
+
+### EP8 steady-state frame write (confirmed from pcap)
+Do NOT add `0x30` before the address window in `forward_display`. The real NIHA sends:
+`0x75 0x00 0x3f`, `0x15 0x00 0x54`, then RAMWR — no `0x30` prefix for steady-state frames.
+`0xaf` is sent after the FIRST RAMWR only (one-time), not on every frame.
+
 ## Do not
 
-- `0xa4` (display follows RAM content) and `0xaf` (display ON) ARE required in display init — confirmed from `mk1_device_replay_startup_init` pcap capture. Without `0xaf` the output stays disabled even if RAMWR succeeds.
+- `0xaf` (display ON) IS required in display init — without it output stays disabled. Send it at the end of the 18-command init sequence.
+- Do not send `0x30` before address window in `forward_display` — display stays in extension mode between frames; adding `0x30` interferes (tested; reverted)
 - Do not assume SSD1327 register layout — this is ST7529
 - Do not write LED commands to EP8 — LEDs go on EP1 only
 - Do not forward raw USB bytes as IPC pad/button payloads — use the semantic formats above

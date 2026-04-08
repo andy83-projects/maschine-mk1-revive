@@ -181,16 +181,29 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
     DLOG("disp=%u y=%u x=%u h=%u w=%u bytes_per_row=%zu pixel_len=%u",
          disp_idx, y, x, h, w, bytes_per_row, pixel_len);
 
-    // Composite update region into the local framebuffer at the correct (y, x) position.
     const uint8_t *pixels = raw_msg + IPC_DISPLAY_HDR_LEN;
+
+    // Skip all-zero (pure black) updates — Maschine sends these as view-transition clears
+    // before new content arrives. Holding the previous frame prevents a brief dark flash.
+    bool all_black = true;
+    for (size_t i = 0; i < (size_t)pixel_len && all_black; i++) {
+        if (pixels[i] != 0x00) all_black = false;
+    }
+    if (all_black) {
+        DLOG("disp=%u skipping all-black update (pixel_len=%u)", disp_idx, pixel_len);
+        return;
+    }
+
+    // Composite update region into the local framebuffer at the correct (y, x) position.
     for (uint16_t r = 0; r < h; r++) {
         memcpy(g_display_fb[disp_idx] + (y + r) * DISPLAY_BYTES_PER_ROW + byte_x,
                pixels + r * bytes_per_row,
                bytes_per_row);
     }
 
-    // Re-set address window before RAMWR on every write (matches original NIHA pcap behaviour).
-    // Without this the ST7529 write pointer is undefined after init and nothing renders.
+    // Reset address window before RAMWR. No 0x30 (enter extension) needed —
+    // the display stays in extension mode between frames (init ends in extension mode,
+    // no 0x31 is ever sent). pcap confirms: steady-state frames send 0x75+0x15+RAMWR only.
     uint8_t usb_base = disp_idx == 0 ? 0x00 : 0x02;
     static const uint8_t row_cmd[3] = { 0x75, 0x00, 0x3f };   // rows 0–63
     static const uint8_t col_cmd[3] = { 0x15, 0x00, 0x54 };   // cols 0–84

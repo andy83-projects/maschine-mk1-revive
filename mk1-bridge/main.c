@@ -34,16 +34,18 @@ static FILE *g_log_bridge  = NULL;
 static FILE *g_log_led     = NULL;
 static FILE *g_log_display = NULL;
 static FILE *g_log_buttons = NULL;
+static FILE *g_log_encoder = NULL;
 
 #define LOG(fp, fmt, ...) do { \
     fprintf(stderr,  fmt "\n", ##__VA_ARGS__); \
     if (fp) { fprintf(fp, fmt "\n", ##__VA_ARGS__); fflush(fp); } \
 } while (0)
 
-#define BLOG(fmt, ...)  LOG(g_log_bridge,  "[bridge]  " fmt, ##__VA_ARGS__)
-#define LLOG(fmt, ...)  LOG(g_log_led,     "[led]     " fmt, ##__VA_ARGS__)
-#define DLOG(fmt, ...)  LOG(g_log_display, "[display] " fmt, ##__VA_ARGS__)
-#define BTNLOG(fmt, ...) LOG(g_log_buttons,"[buttons] " fmt, ##__VA_ARGS__)
+#define BLOG(fmt, ...)   LOG(g_log_bridge,  "[bridge]  " fmt, ##__VA_ARGS__)
+#define LLOG(fmt, ...)   LOG(g_log_led,     "[led]     " fmt, ##__VA_ARGS__)
+#define DLOG(fmt, ...)   LOG(g_log_display, "[display] " fmt, ##__VA_ARGS__)
+#define BTNLOG(fmt, ...) LOG(g_log_buttons, "[buttons] " fmt, ##__VA_ARGS__)
+#define ENCLOG(fmt, ...) LOG(g_log_encoder, "[encoder] " fmt, ##__VA_ARGS__)
 
 static void open_logs(void)
 {
@@ -66,8 +68,11 @@ static void open_logs(void)
     OPEN_LOG(g_log_led,     "led.log")
     OPEN_LOG(g_log_display, "display.log")
     OPEN_LOG(g_log_buttons, "buttons.log")
+    OPEN_LOG(g_log_encoder, "encoder.log")
 
 #undef OPEN_LOG
+
+    mk1_device_set_encoder_log(g_log_encoder);
 }
 
 static void close_logs(void)
@@ -76,6 +81,8 @@ static void close_logs(void)
     if (g_log_led)     { fclose(g_log_led);     g_log_led     = NULL; }
     if (g_log_display) { fclose(g_log_display); g_log_display = NULL; }
     if (g_log_buttons) { fclose(g_log_buttons); g_log_buttons = NULL; }
+    if (g_log_encoder) { fclose(g_log_encoder); g_log_encoder = NULL; }
+    mk1_device_set_encoder_log(NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +476,16 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
 
     uint32_t msg_type = 0;
     if (ev->len >= 4) memcpy(&msg_type, ev->raw, 4);
-    BTNLOG("button event len=%zu type=0x%08x", ev->len, msg_type);
+
+    if (msg_type == NI_EVT_KNOB_ROTATE && ev->len >= 24) {
+        uint32_t encoder_index = 0;
+        float    delta         = 0.0f;
+        memcpy(&encoder_index, ev->raw + 16, 4);
+        memcpy(&delta,         ev->raw + 20, 4);
+        ENCLOG("idx=%u delta=%.4f", encoder_index, delta);
+    } else {
+        BTNLOG("button event len=%zu type=0x%08x", ev->len, msg_type);
+    }
 
     mk1_server_send_event(br->srv, ev->raw, ev->len);
 }

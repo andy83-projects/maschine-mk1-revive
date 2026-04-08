@@ -34,6 +34,8 @@ Working as of 2026-04-08:
 - All LEDs respond (buttons, groups, transport, pad rubber LEDs via EP1 DIMM_LEDS)
 - Pads register velocity and pressure (EP4 64-byte reports, 12-bit ADC, IPC forwarded)
 - Group, transport, and screen buttons registered (EP1 short reports)
+- All 11 encoders forwarded: Volume, Tempo, Swing (Master Section) + 8 screen area encoders
+- USB hot-plug: bridge can start before device is connected; device can be unplugged and re-plugged
 
 ### Components
 
@@ -107,7 +109,9 @@ The `mk1-shim` target builds independently.
 - [x] Pad input events — EP4 64-byte reports decoded; pressure, hit-on/off forwarded via IPC
 - [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded
 - [~] Display backlight stays on — toggles briefly on certain button presses (under investigation)
-- [ ] Master Section knobs (encoder events not yet forwarded)
-- [ ] USB hot-plug (device arrival/removal notifications)
+- [x] Master Section knobs — Volume, Tempo, Swing encoder events forwarded via IPC
+- [x] Screen area encoders — all 8 encoders mapped (byte pairs confirmed from hardware capture)
+- [x] USB hot-plug — bridge survives device unplug/replug; starts before device is connected
+- [ ] Bridge reconnect — if bridge is restarted while Maschine is open, controller dead until Maschine restarts
 - [ ] launchd agent plist
 - [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)

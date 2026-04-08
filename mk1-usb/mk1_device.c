@@ -114,6 +114,10 @@ struct mk1_user_client {
     mk1_uc_async_registration_t    encoder_read;
 };
 
+static FILE *g_encoder_log = NULL;
+
+void mk1_device_set_encoder_log(FILE *fp) { g_encoder_log = fp; }
+
 static int32_t mk1_uc_send_ep1_command(mk1_user_client_t *client,
                                        uint8_t command,
                                        const void *payload,
@@ -1025,18 +1029,52 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         return;
     }
 
+    // Log changed bytes to encoder log so we can identify unmapped encoder positions.
+    if (dev->ep1_len33_prev_valid && g_encoder_log) {
+        bool any_changed = false;
+        for (int b = 0; b < 33; b++) {
+            if (data[b] != dev->ep1_len33_prev[b]) {
+                if (!any_changed) {
+                    fprintf(g_encoder_log, "[encoder] len33:");
+                    any_changed = true;
+                }
+                fprintf(g_encoder_log, " [%d]%02x→%02x", b, dev->ep1_len33_prev[b], data[b]);
+            }
+        }
+        if (any_changed) { fprintf(g_encoder_log, "\n"); fflush(g_encoder_log); }
+    }
+
     static const struct {
         uint8_t byte_a;
         uint8_t byte_b;
         uint32_t encoder_index;
         const char *name;
     } knob_map[] = {
-        // Byte positions come from Apple Silicon USB traces; encoder indexes are
-        // confirmed by the dedicated Intel Volume/Tempo/Swing capture.
+        // Master section — byte positions and IPC indices confirmed from
+        // Apple Silicon USB traces + Intel Volume/Tempo/Swing IPC capture.
         { 17, 18, 0, "Volume" },
         { 11, 12, 1, "Tempo" },
         {  5,  6, 2, "Swing" },
+        // Screen area encoders — byte positions and physical order confirmed from
+        // Apple Silicon encoder.log one-at-a-time capture (2026-04-08).
+        // Physical left→right on left display: #1(21,22) #2(15,16) #3(9,10) #4(3,4)
+        // Physical left→right on right display: #5(19,20) #6(13,14) #7(7,8) #8(1,2)
+        // IPC indices 3–10 assigned left-to-right across both displays.
+        { 21, 22,  3, "Screen1" },   // left display, leftmost
+        { 15, 16,  4, "Screen2" },
+        {  9, 10,  5, "Screen3" },
+        {  3,  4,  6, "Screen4" },   // left display, rightmost
+        { 19, 20,  7, "Screen5" },   // right display, leftmost
+        { 13, 14,  8, "Screen6" },
+        {  7,  8,  9, "Screen7" },
+        {  1,  2, 10, "Screen8" },   // right display, rightmost
     };
+
+    // byte[4] doubles as the secondary byte for Screen4 encoder AND the Auto Write/Sampling
+    // button discriminator. Detect the button state first so the encoder loop can skip
+    // frames where byte[4] is in a button range (0x6x/0x7x) rather than an encoder position.
+    uint8_t b4_high_nibble = data[4] & 0xf0;
+    bool b4_is_button = (b4_high_nibble == 0x60 || b4_high_nibble == 0x70);
 
     for (size_t i = 0; i < sizeof(knob_map) / sizeof(knob_map[0]); i++) {
         uint8_t prev_a = dev->ep1_len33_prev[knob_map[i].byte_a];
@@ -1045,6 +1083,12 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         uint8_t curr_b = data[knob_map[i].byte_b];
 
         if (prev_a == 0 && prev_b == 0 && !dev->ep1_len33_prev_valid) {
+            continue;
+        }
+
+        // Skip encoder if its secondary byte is byte[4] and byte[4] is in button range —
+        // the value is a button state code, not an encoder position.
+        if (knob_map[i].byte_b == 4 && b4_is_button) {
             continue;
         }
 
@@ -1063,13 +1107,15 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         }
     }
 
-    uint8_t br = data[4];
-    uint8_t high_nibble = br & 0xf0;
+    // Always update prev before the button early-returns so Screen4 encoder has a fresh
+    // baseline even if this frame ended in an Auto Write / Sampling early-return.
+    memcpy(dev->ep1_len33_prev, data, sizeof(dev->ep1_len33_prev));
+    dev->ep1_len33_prev_valid = true;
+
     // Observed traces: Auto Write pulses show a 0x7x high nibble, Sampling pulses appear as 0x6x,
     // and the shared release state resides in the 0x5x range.  We emit NI BTN_DATA events
     // whenever we cross those boundaries.
-
-    if (high_nibble == 0x70) {
+    if (b4_high_nibble == 0x70) {
         if (!dev->ep1_33_autowrite_pressed) {
             dev->ep1_33_autowrite_pressed = true;
             dev->ep1_33_sampling_pressed = false;
@@ -1078,7 +1124,7 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         return;
     }
 
-    if (high_nibble == 0x60) {
+    if (b4_high_nibble == 0x60) {
         if (!dev->ep1_33_sampling_pressed) {
             dev->ep1_33_sampling_pressed = true;
             dev->ep1_33_autowrite_pressed = false;
@@ -1087,7 +1133,7 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         return;
     }
 
-    if (high_nibble == 0x50) {
+    if (b4_high_nibble == 0x50) {
         if (dev->ep1_33_autowrite_pressed) {
             dev->ep1_33_autowrite_pressed = false;
             mk1_emit_button_event(dev, "Auto Write", 0x1c, false);
@@ -1097,9 +1143,6 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
             mk1_emit_button_event(dev, "Sampling", 0x1e, false);
         }
     }
-
-    memcpy(dev->ep1_len33_prev, data, sizeof(dev->ep1_len33_prev));
-    dev->ep1_len33_prev_valid = true;
 }
 
 static void mk1_device_process_ep1_button_packet(mk1_device_t *dev,

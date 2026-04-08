@@ -52,6 +52,22 @@ void          mk1_device_close(mk1_device_t *dev);
 bool          mk1_device_is_open(const mk1_device_t *dev);
 bool          mk1_device_get_serial(const mk1_device_t *dev, char *serial, size_t len);
 
+// Hot-plug: watch for MK1 arrival and removal via IOKit notifications.
+// Integrates with CFRunLoop — call mk1_hotplug_start() before CFRunLoopRun().
+// arrived_cb fires when the device appears (including if already plugged in at start).
+// removed_cb fires when the device is unplugged.
+// Drain the initial iterator in arrived_cb before doing anything — notifications
+// use an edge-triggered model and the first callback arms future ones.
+typedef void (*mk1_hotplug_arrived_cb_t)(void *ctx);
+typedef void (*mk1_hotplug_removed_cb_t)(void *ctx);
+
+typedef struct mk1_hotplug mk1_hotplug_t;
+
+mk1_hotplug_t *mk1_hotplug_start(mk1_hotplug_arrived_cb_t arrived,
+                                   mk1_hotplug_removed_cb_t removed,
+                                   void *ctx);
+void mk1_hotplug_stop(mk1_hotplug_t *hp);
+
 // Start reading (spawns background thread)
 bool mk1_device_start(mk1_device_t *dev,
                       mk1_pad_callback_t    pad_cb,

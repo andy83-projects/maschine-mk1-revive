@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 
 #include "mk1_server.h"
 #include "../mk1-usb/mk1_device.h"
@@ -82,8 +83,9 @@ static void close_logs(void)
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    mk1_server_t  *srv;
-    mk1_device_t  *usb;
+    mk1_server_t   *srv;
+    mk1_device_t   *usb;
+    mk1_hotplug_t  *hotplug;
 } bridge_t;
 
 static bridge_t g_bridge;
@@ -471,6 +473,84 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
 }
 
 // ---------------------------------------------------------------------------
+// Hot-plug callbacks
+// ---------------------------------------------------------------------------
+
+// Open, init, and start USB. Returns true on success.
+static bool device_open_and_init(bridge_t *br)
+{
+    br->usb = mk1_device_open();
+    if (!br->usb) return false;
+
+    if (!mk1_device_init_hardware(br->usb)) {
+        BLOG("WARNING: hardware init failed after arrival");
+    }
+
+    if (!mk1_device_start(br->usb, on_pad, on_button, br)) {
+        BLOG("WARNING: could not start USB read thread after arrival");
+    }
+
+    // If Maschine is already connected, announce the device now.
+    if (br->srv && mk1_server_is_connected(br->srv)) {
+        char serial[32] = "MK1000000000000";
+        mk1_device_get_serial(br->usb, serial, sizeof(serial));
+        if (!mk1_server_send_device_on(br->srv, serial)) {
+            BLOG("WARNING: DEVICE_ON send failed after arrival");
+        }
+    }
+    return true;
+}
+
+static void on_device_arrived(void *ctx)
+{
+    bridge_t *br = (bridge_t *)ctx;
+
+    if (br->usb) {
+        BLOG("device arrived but already open — ignoring");
+        return;
+    }
+
+    BLOG("MK1 arrived — opening");
+    if (device_open_and_init(br)) return;
+
+    // kIOFirstMatchNotification can fire before the USB stack has finished
+    // publishing interface services. Retry once after a short delay.
+    BLOG("open failed — retrying in 500ms");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (br->usb) return; // arrived again while we were waiting
+        BLOG("MK1 retry open");
+        if (!device_open_and_init(br)) {
+            BLOG("retry failed — device not usable");
+        }
+    });
+}
+
+static void on_device_removed(void *ctx)
+{
+    bridge_t *br = (bridge_t *)ctx;
+
+    if (!br->usb) {
+        BLOG("device removed but not open — ignoring");
+        return;
+    }
+
+    BLOG("MK1 removed — closing");
+
+    // Notify Maschine before tearing down USB so the IPC message goes out.
+    if (br->srv && mk1_server_is_connected(br->srv)) {
+        mk1_server_send_device_off(br->srv);
+    }
+
+    mk1_device_stop(br->usb);
+    mk1_device_close(br->usb);
+    br->usb = NULL;
+
+    // Reset pad state so stale pressure readings don't linger on reconnect.
+    memset(g_prev_pressure, 0, sizeof(g_prev_pressure));
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -485,33 +565,27 @@ int main(int argc, char **argv)
 
     BLOG("mk1-bridge starting");
 
-    g_bridge.usb = mk1_device_open();
-    if (g_bridge.usb) {
-        BLOG("USB device opened");
-        if (!mk1_device_init_hardware(g_bridge.usb)) {
-            BLOG("WARNING: hardware init failed");
-        }
-        if (!mk1_device_start(g_bridge.usb, on_pad, on_button, &g_bridge)) {
-            BLOG("WARNING: could not start USB read thread");
-        }
-    } else {
-        BLOG("No USB device — IPC-only mode");
-    }
-
     g_bridge.srv = mk1_server_start(on_connect, on_cmd, &g_bridge);
     if (!g_bridge.srv) {
         BLOG("Failed to start IPC server");
-        if (g_bridge.usb) mk1_device_close(g_bridge.usb);
         close_logs();
         return 1;
     }
 
-    BLOG("waiting for Maschine software...");
+    // Hot-plug watcher — fires immediately if device is already connected,
+    // and again on any future plug/unplug while the run loop is running.
+    g_bridge.hotplug = mk1_hotplug_start(on_device_arrived, on_device_removed, &g_bridge);
+    if (!g_bridge.hotplug) {
+        BLOG("WARNING: hot-plug watcher failed to start");
+    }
+
+    BLOG("waiting for MK1 and Maschine software...");
     CFRunLoopRun();
 
     if (g_bridge.usb && mk1_server_is_connected(g_bridge.srv)) {
         mk1_server_send_device_off(g_bridge.srv);
     }
+    mk1_hotplug_stop(g_bridge.hotplug);
     mk1_server_stop(g_bridge.srv);
     if (g_bridge.usb) {
         mk1_device_stop(g_bridge.usb);

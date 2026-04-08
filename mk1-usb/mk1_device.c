@@ -2584,3 +2584,150 @@ bool mk1_user_client_map_memory(mk1_user_client_t *client,
     *size = client->client_memory_size[memory_type];
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Hot-plug: IOKit service match/terminate notifications
+// ---------------------------------------------------------------------------
+
+struct mk1_hotplug {
+    IONotificationPortRef     port;
+    io_iterator_t             arrived_iter;
+    io_iterator_t             removed_iter;
+    mk1_hotplug_arrived_cb_t  arrived_cb;
+    mk1_hotplug_removed_cb_t  removed_cb;
+    void                     *ctx;
+};
+
+// Build a matching dict for IOUSBDevice with VID=0x17CC, PID=0x0808.
+// Caller is responsible for releasing (or passing ownership to IOKit).
+static CFMutableDictionaryRef mk1_build_matching_dict(void)
+{
+    CFMutableDictionaryRef d = IOServiceMatching("IOUSBDevice");
+    if (!d) return NULL;
+    int vid = MK1_VENDOR_ID;
+    int pid = MK1_PRODUCT_ID;
+    CFNumberRef vid_ref = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vid);
+    CFNumberRef pid_ref = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pid);
+    if (vid_ref && pid_ref) {
+        CFDictionarySetValue(d, CFSTR("idVendor"),  vid_ref);
+        CFDictionarySetValue(d, CFSTR("idProduct"), pid_ref);
+    }
+    if (vid_ref) CFRelease(vid_ref);
+    if (pid_ref) CFRelease(pid_ref);
+    return d;
+}
+
+static void hotplug_arrived_cb(void *ctx, io_iterator_t iter)
+{
+    mk1_hotplug_t *hp = (mk1_hotplug_t *)ctx;
+    // Drain the iterator — required to re-arm future notifications.
+    io_service_t svc;
+    bool any = false;
+    while ((svc = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
+        IOObjectRelease(svc);
+        any = true;
+    }
+    if (any && hp->arrived_cb) {
+        fprintf(stderr, "[mk1-hotplug] MK1 arrived\n");
+        hp->arrived_cb(hp->ctx);
+    }
+}
+
+static void hotplug_removed_cb(void *ctx, io_iterator_t iter)
+{
+    mk1_hotplug_t *hp = (mk1_hotplug_t *)ctx;
+    io_service_t svc;
+    bool any = false;
+    while ((svc = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
+        IOObjectRelease(svc);
+        any = true;
+    }
+    if (any && hp->removed_cb) {
+        fprintf(stderr, "[mk1-hotplug] MK1 removed\n");
+        hp->removed_cb(hp->ctx);
+    }
+}
+
+mk1_hotplug_t *mk1_hotplug_start(mk1_hotplug_arrived_cb_t arrived,
+                                   mk1_hotplug_removed_cb_t removed,
+                                   void *ctx)
+{
+    mk1_hotplug_t *hp = calloc(1, sizeof(*hp));
+    if (!hp) return NULL;
+    hp->arrived_cb = arrived;
+    hp->removed_cb = removed;
+    hp->ctx        = ctx;
+
+    hp->port = IONotificationPortCreate(kIOMainPortDefault);
+    if (!hp->port) {
+        fprintf(stderr, "[mk1-hotplug] IONotificationPortCreate failed\n");
+        free(hp);
+        return NULL;
+    }
+
+    CFRunLoopAddSource(CFRunLoopGetMain(),
+                       IONotificationPortGetRunLoopSource(hp->port),
+                       kCFRunLoopDefaultMode);
+
+    // Arrived (kIOFirstMatchNotification fires for already-present devices too).
+    CFMutableDictionaryRef match_a = mk1_build_matching_dict();
+    if (!match_a) goto fail;
+    IOReturn kr = IOServiceAddMatchingNotification(hp->port,
+                                                   kIOFirstMatchNotification,
+                                                   match_a,
+                                                   hotplug_arrived_cb,
+                                                   hp,
+                                                   &hp->arrived_iter);
+    if (kr != kIOReturnSuccess) {
+        fprintf(stderr, "[mk1-hotplug] AddMatchingNotification(arrived) failed: 0x%08x\n", kr);
+        goto fail;
+    }
+    // Drain initial iterator to arm future notifications.
+    // If a device is already present this fires arrived_cb synchronously.
+    hotplug_arrived_cb(hp, hp->arrived_iter);
+
+    // Removed (kIOTerminatedNotification).
+    CFMutableDictionaryRef match_r = mk1_build_matching_dict();
+    if (!match_r) goto fail;
+    kr = IOServiceAddMatchingNotification(hp->port,
+                                          kIOTerminatedNotification,
+                                          match_r,
+                                          hotplug_removed_cb,
+                                          hp,
+                                          &hp->removed_iter);
+    if (kr != kIOReturnSuccess) {
+        fprintf(stderr, "[mk1-hotplug] AddMatchingNotification(removed) failed: 0x%08x\n", kr);
+        goto fail;
+    }
+    // Drain (no devices are "terminated" at startup, but required to arm).
+    hotplug_removed_cb(hp, hp->removed_iter);
+
+    fprintf(stderr, "[mk1-hotplug] watching for MK1 (VID=%04x PID=%04x)\n",
+            MK1_VENDOR_ID, MK1_PRODUCT_ID);
+    return hp;
+
+fail:
+    mk1_hotplug_stop(hp);
+    return NULL;
+}
+
+void mk1_hotplug_stop(mk1_hotplug_t *hp)
+{
+    if (!hp) return;
+    if (hp->arrived_iter != IO_OBJECT_NULL) {
+        IOObjectRelease(hp->arrived_iter);
+        hp->arrived_iter = IO_OBJECT_NULL;
+    }
+    if (hp->removed_iter != IO_OBJECT_NULL) {
+        IOObjectRelease(hp->removed_iter);
+        hp->removed_iter = IO_OBJECT_NULL;
+    }
+    if (hp->port) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(),
+                              IONotificationPortGetRunLoopSource(hp->port),
+                              kCFRunLoopDefaultMode);
+        IONotificationPortDestroy(hp->port);
+        hp->port = NULL;
+    }
+    free(hp);
+}

@@ -150,11 +150,17 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
     }
 
     uint8_t  disp_idx = raw_msg[4] & 0x01;   // 0=left, 1=right
-    uint16_t y, h;
+    uint16_t y, x, h, w;
     uint32_t pixel_len;
     memcpy(&y,         raw_msg + 8,  2);
+    memcpy(&x,         raw_msg + 10, 2);
     memcpy(&h,         raw_msg + 12, 2);
+    memcpy(&w,         raw_msg + 14, 2);
     memcpy(&pixel_len, raw_msg + 16, 4);
+
+    // x/w are in logical pixels; NI encoding packs 3px → 2 bytes.
+    // x must be divisible by 3. byte_x = (x/3)*2.
+    size_t byte_x = ((size_t)x / 3) * 2;
 
     if (h == 0 || (uint32_t)y + h > DISPLAY_ROWS) {
         DLOG("disp=%u bad y=%u h=%u", disp_idx, y, h);
@@ -166,27 +172,31 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
     }
 
     size_t bytes_per_row = pixel_len / h;
-    if (bytes_per_row == 0 || bytes_per_row > DISPLAY_BYTES_PER_ROW) {
-        DLOG("disp=%u unexpected bytes_per_row=%zu (pixel_len=%u h=%u)",
-             disp_idx, bytes_per_row, pixel_len, h);
+    if (bytes_per_row == 0 || byte_x + bytes_per_row > DISPLAY_BYTES_PER_ROW) {
+        DLOG("disp=%u unexpected bytes_per_row=%zu byte_x=%zu (pixel_len=%u h=%u w=%u)",
+             disp_idx, bytes_per_row, byte_x, pixel_len, h, w);
         return;
     }
 
-    DLOG("disp=%u y=%u h=%u bytes_per_row=%zu pixel_len=%u",
-         disp_idx, y, h, bytes_per_row, pixel_len);
+    DLOG("disp=%u y=%u x=%u h=%u w=%u bytes_per_row=%zu pixel_len=%u",
+         disp_idx, y, x, h, w, bytes_per_row, pixel_len);
 
-    // Composite update region into the local framebuffer.
+    // Composite update region into the local framebuffer at the correct (y, x) position.
     const uint8_t *pixels = raw_msg + IPC_DISPLAY_HDR_LEN;
     for (uint16_t r = 0; r < h; r++) {
-        memcpy(g_display_fb[disp_idx] + (y + r) * DISPLAY_BYTES_PER_ROW,
+        memcpy(g_display_fb[disp_idx] + (y + r) * DISPLAY_BYTES_PER_ROW + byte_x,
                pixels + r * bytes_per_row,
                bytes_per_row);
     }
 
-    // Send full framebuffer: [0x5c, <10880 bytes>], chunked at 508.
-    // RAMWR resets the ST7529 write pointer to the start of the address window,
-    // so always sending the full frame keeps the pointer anchored at row 0.
+    // Re-set address window before RAMWR on every write (matches original NIHA pcap behaviour).
+    // Without this the ST7529 write pointer is undefined after init and nothing renders.
     uint8_t usb_base = disp_idx == 0 ? 0x00 : 0x02;
+    static const uint8_t row_cmd[3] = { 0x75, 0x00, 0x3f };   // rows 0–63
+    static const uint8_t col_cmd[3] = { 0x15, 0x00, 0x54 };   // cols 0–84
+    mk1_set_display(br->usb, usb_base, row_cmd, sizeof(row_cmd));
+    mk1_set_display(br->usb, usb_base, col_cmd, sizeof(col_cmd));
+
     uint8_t *frame = malloc(1 + DISPLAY_FB_BYTES);
     if (!frame) return;
     frame[0] = ST7529_RAMWR;

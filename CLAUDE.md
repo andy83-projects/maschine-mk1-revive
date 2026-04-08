@@ -312,7 +312,7 @@ xcodebuild -project maschine-mk1-revive.xcodeproj -scheme mk1-bridge -configurat
 
 ## Do not
 
-- Do not add `0xa4`/`0xaf` to display init — wrong (guessed before pcap analysis)
+- `0xa4` (display follows RAM content) and `0xaf` (display ON) ARE required in display init — confirmed from `mk1_device_replay_startup_init` pcap capture. Without `0xaf` the output stays disabled even if RAMWR succeeds.
 - Do not assume SSD1327 register layout — this is ST7529
 - Do not write LED commands to EP8 — LEDs go on EP1 only
 - Do not forward raw USB bytes as IPC pad/button payloads — use the semantic formats above

@@ -1982,6 +1982,8 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
     //    Format: [display_idx, len_hi, len_lo, command_data...]
     {
         static const struct { size_t len; uint8_t bytes[8]; } display_cmds[] = {
+            // 17-command init sequence (ep08.txt pcap-confirmed, verbatim).
+            // 0xbc uses UI-mode scan direction [0x02,0x01,0x01] (not animation [0x00,0x00,0x02]).
             { 1, { 0x30 } },                    // enter extension set (SEC)
             { 4, { 0xca, 0x04, 0x0f, 0x00 } },  // duty / display lines
             { 2, { 0xbb, 0x00 } },               // COM scan direction
@@ -1990,15 +1992,16 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
             { 3, { 0x81, 0x1e, 0x02 } },         // electronic volume (contrast = 0x1e)
             { 2, { 0x20, 0x08 } },               // power control
             { 2, { 0x20, 0x0b } },               // power control
-            { 1, { 0xa6 } },                    // normal display (non-inverted)
+            { 1, { 0xa6 } },                    // normal display, non-inverted
             { 1, { 0x31 } },                    // exit extension set
             { 4, { 0x32, 0x00, 0x00, 0x05 } },   // scroll/scan config
-            { 1, { 0x34 } },                    // scroll off / display enable
+            { 1, { 0x34 } },                    // scroll off
             { 1, { 0x30 } },                    // re-enter extension set
-            { 4, { 0xbc, 0x00, 0x00, 0x02 } },   // data scan direction
+            { 4, { 0xbc, 0x02, 0x01, 0x01 } },   // data scan direction: UI mode (pcap transition)
             { 3, { 0x75, 0x00, 0x3f } },          // row address range: 0–63
             { 3, { 0x15, 0x00, 0x54 } },          // col address range: 0–84 (170px)
-            { 3, { 0x81, 0x20, 0x02 } },          // electronic volume final (contrast = 0x20)
+            { 3, { 0x81, 0x20, 0x02 } },          // electronic volume (contrast = 0x20)
+            { 1, { 0xaf } },                    // display ON (extension mode, cmd 18)
         };
         size_t ep8_ok = 0, ep8_fail = 0;
 

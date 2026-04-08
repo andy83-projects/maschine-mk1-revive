@@ -17,19 +17,23 @@ Kernel extensions are dead on Apple Silicon. The kext never received an ARM64 bu
 Entirely userspace. No DriverKit, no kernel code, no special entitlements.
 
 ```
-[Maschine.app] ←─CFMessagePort─→ [NIHardwareAgent]
+[Maschine.app] ←─CFMessagePort─→ [mk1-bridge]  ← our daemon (impersonates NIHA)
                                         ↑
-                                  [mk1-bridge]  ← our daemon
-                                        ↑
-                               IOUSBHost / hidapi
+                                    IOKit USB (bulk transfers)
                                         ↑
                                   [MK1 hardware]
 ```
 
-`NIHardwareAgent` speaks `CFMessagePort` IPC to the Maschine software.
-Our bridge daemon claims the USB device first (before NIHardwareAgent can),
-reads HID reports from the hardware, and forwards them over IPC — making
-NIHardwareAgent believe it has a working device.
+`mk1-bridge` impersonates `NIHardwareAgent` entirely — it kills the real NIHA and
+registers the `NIHWMainHandler` CFMessagePort itself. It owns both ends: full IPC
+handshake with the Maschine app and direct IOKit USB bulk transfers to the hardware.
+
+Working as of 2026-04-08:
+- Maschine software detects the MK1 in its controller list
+- Both displays render correctly (ST7529, EP8 bulk, 170×64 grayscale)
+- All LEDs respond (buttons, groups, transport, pad rubber LEDs via EP1 DIMM_LEDS)
+- Pads register velocity and pressure (EP4 64-byte reports, 12-bit ADC, IPC forwarded)
+- Group, transport, and screen buttons registered (EP1 short reports)
 
 ### Components
 
@@ -73,31 +77,12 @@ This project leans heavily on reverse engineering work by others:
 
 ## IPC Protocol
 
-NIHardwareAgent communicates via `CFMessagePort` (Mach-based).
-- Port name: `NIHWMainHandler`
-- Handshake sequence: TBD (see `docs/ipc-protocol.md`)
-- Message format: TBD (fill in from Intel Mac capture session)
-
-## Intel Mac Data Collection
-
-Before the bridge can work, we need to capture from a working system:
-
-```bash
-# 1. kext Info.plist — matching config and IOKit class names
-cat /Library/Extensions/NIUSBMaschineController.kext/Contents/Info.plist
-
-# 2. IORegistry entry — what the kext publishes (device must be plugged in)
-ioreg -l -w 0 -p IOService | grep -B 2 -A 80 "Maschine"
-
-# 3. Confirm kext loaded
-kextstat | grep -i "native\|NIUSB\|maschine"
-
-# 4. USB descriptor
-system_profiler SPUSBDataType | grep -A 20 "Maschine"
-
-# 5. What NIHardwareAgent has open (run while Maschine software is running)
-lsof -p $(pgrep NIHardwareAgent) | grep -i "usb\|hid\|ni"
-```
+`mk1-bridge` impersonates NIHardwareAgent via `CFMessagePort` (Mach-based).
+- Port name: `NIHWMainHandler` (registered by bridge, kills real NIHA first)
+- Full handshake: GetServiceVersion → PID_CONNECT → ACK_NOTIF_PORT → SERIAL_CONNECT → START
+- Input events: pad pressure (NI_EVT_PAD_DATA), button state (NI_EVT_BTN_DATA)
+- Output commands: LED brightness (NI_CMD_LED → EP1 DIMM_LEDS), display frames (EP8 RAMWR)
+- Protocol fully documented in `CLAUDE.md` and `mk1-ipc/mk1_ipc.h`
 
 ## Build
 
@@ -116,10 +101,13 @@ The `mk1-shim` target builds independently.
 - [x] USB device claim (IOKit direct, not HID)
 - [x] IPC handshake (full NIHA impersonation including Serial Connect phase)
 - [x] Bridge daemon skeleton (`mk1-bridge`) — Maschine detects MK1 in controller list
-- [x] Display init sequence (EP8, ST7529, 17-command sequence confirmed from pcap)
-- [~] LED forwarding — button LEDs confirmed working; pad LED visibility under test
+- [x] Display init (EP8, ST7529 17-command sequence; UI-mode scan direction `0xbc [0x02,0x01,0x01]`)
+- [x] LCD display pixel updates — full framebuffer composite + RAMWR; display renders correctly
+- [x] LED forwarding — button/group/transport/pad rubber LEDs all confirmed working
+- [x] Pad input events — EP4 64-byte reports decoded; pressure, hit-on/off forwarded via IPC
+- [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded
+- [~] Display backlight stays on — toggles briefly on certain button presses (under investigation)
+- [ ] Master Section knobs (encoder events not yet forwarded)
 - [ ] USB hot-plug (device arrival/removal notifications)
-- [ ] LCD display pixel updates (IPC display message format unconfirmed)
-- [ ] Pad/button/knob input events (USB report format needs decode)
 - [ ] launchd agent plist
-- [ ] End-to-end test with Maschine software
+- [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)

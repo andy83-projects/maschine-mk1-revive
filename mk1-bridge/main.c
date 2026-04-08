@@ -101,6 +101,93 @@ static volatile int g_running = 1;
 static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRunLoopGetMain()); }
 
 // ---------------------------------------------------------------------------
+// Session state — for bridge reconnect while Maschine is running
+//
+// When a full instance handshake completes, we write Maschine's notification
+// port name to a file.  On the next bridge startup, if Maschine is still
+// running, we connect to that port and send DEVICE_OFF.  This kicks Maschine
+// out of its stale "connected" state so it retries the NIHWMainHandler
+// handshake — which now hits our freshly-registered bridge.
+// ---------------------------------------------------------------------------
+
+#define SESSION_FILE "/tmp/mk1bridge.session"
+
+static void save_session_state(const char *notif_name)
+{
+    FILE *f = fopen(SESSION_FILE, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", notif_name);
+    fclose(f);
+    BLOG("session saved: notif port '%s'", notif_name);
+}
+
+static bool load_session_state(char *buf, size_t len)
+{
+    FILE *f = fopen(SESSION_FILE, "r");
+    if (!f) return false;
+    bool ok = (fgets(buf, (int)len, f) != NULL);
+    fclose(f);
+    if (ok) {
+        size_t l = strlen(buf);
+        while (l > 0 && (buf[l-1] == '\n' || buf[l-1] == '\r')) buf[--l] = '\0';
+    }
+    return ok && buf[0] != '\0';
+}
+
+static void try_maschine_reconnect(void)
+{
+    char notif_name[256] = {0};
+    if (!load_session_state(notif_name, sizeof(notif_name))) return;
+
+    // Check if Maschine is running.
+    FILE *pg = popen("pgrep -x Maschine 2>/dev/null", "r");
+    if (!pg) return;
+    char pid_line[32] = {0};
+    bool running = (fgets(pid_line, sizeof(pid_line), pg) != NULL && pid_line[0] != '\0');
+    pclose(pg);
+
+    if (!running) {
+        BLOG("reconnect: Maschine not running — stale session file removed");
+        unlink(SESSION_FILE);
+        return;
+    }
+
+    BLOG("reconnect: Maschine running with stale bridge session — sending DEVICE_OFF to '%s'",
+         notif_name);
+
+    CFStringRef port_cf = CFStringCreateWithCString(NULL, notif_name, kCFStringEncodingUTF8);
+    CFMessagePortRef port = CFMessagePortCreateRemote(NULL, port_cf);
+    CFRelease(port_cf);
+
+    if (!port) {
+        BLOG("reconnect: old notif port not reachable — Maschine may have already cleaned up");
+        unlink(SESSION_FILE);
+        return;
+    }
+
+    // DEVICE_OFF = [NI_EVT_DEVICE_OFF(4 LE), MK1_DEVICE_ID(4 LE)]
+    uint8_t msg[8];
+    uint32_t type = NI_EVT_DEVICE_OFF;
+    uint32_t dev  = MK1_DEVICE_ID;
+    memcpy(msg,     &type, 4);
+    memcpy(msg + 4, &dev,  4);
+
+    CFDataRef payload = CFDataCreate(NULL, msg, sizeof(msg));
+    SInt32 result = CFMessagePortSendRequest(port, 0, payload, 1.0, 0.0, NULL, NULL);
+    CFRelease(payload);
+    CFRelease(port);
+
+    unlink(SESSION_FILE);
+
+    if (result == kCFMessagePortSuccess) {
+        BLOG("reconnect: DEVICE_OFF sent — waiting for Maschine to reconnect");
+    } else {
+        BLOG("reconnect: DEVICE_OFF send failed (err=%d) — Maschine may need manual restart",
+             (int)result);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Display: IPC -> USB
 //
 // IPC DISPLAY message layout (confirmed from Macchina RE + bridge logs):
@@ -371,6 +458,15 @@ static void on_connect(void *ctx)
     bridge_t *br = (bridge_t *)ctx;
     BLOG("Maschine software connected");
 
+    // Persist Maschine's notification port name so a future bridge restart can
+    // send DEVICE_OFF through it to trigger Maschine to reconnect.
+    // This fires for both device and instance phases; the name is only available
+    // after the instance phase, so the first call is a no-op.
+    char notif_name[256] = {0};
+    if (mk1_server_get_maschine_notif_name(br->srv, notif_name, sizeof(notif_name))) {
+        save_session_state(notif_name);
+    }
+
     if (!br->usb) {
         BLOG("WARNING: no USB device — IPC-only mode");
         return;
@@ -589,6 +685,13 @@ int main(int argc, char **argv)
         close_logs();
         return 1;
     }
+
+    // If Maschine is already running with a stale bridge session, send DEVICE_OFF
+    // via the saved notification port so it re-initiates the NIHWMainHandler handshake.
+    // Run after a short delay to ensure our NIHWMainHandler port is fully registered
+    // in bootstrap before Maschine's reconnect attempt fires.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ try_maschine_reconnect(); });
 
     // Hot-plug watcher — fires immediately if device is already connected,
     // and again on any future plug/unplug while the run loop is running.

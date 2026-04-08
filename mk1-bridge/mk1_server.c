@@ -175,6 +175,11 @@ struct mk1_server {
 
     char                serial[64];
 
+    // Saved for reconnect: Maschine's instance-level notification port name.
+    // Persisted to disk so a restarted bridge can send DEVICE_OFF and trigger
+    // Maschine to re-initiate the NIHWMainHandler handshake.
+    char                maschine_inst_notif_name[256];
+
     // Callbacks
     mk1_server_connect_cb_t connect_cb;
     mk1_server_cmd_cb_t     cmd_cb;
@@ -516,6 +521,8 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
             if (srv->inst_notif_remote) CFRelease(srv->inst_notif_remote);
             srv->inst_notif_remote = remote;
             srv->inst_connected = true;
+            strlcpy(srv->maschine_inst_notif_name, client_notif,
+                    sizeof(srv->maschine_inst_notif_name));
             fprintf(stderr, "[server] === instance handshake complete ===\n");
             push_numeric_event(srv, NI_EVT_DEVSTATE_BOOL, NI_TAG_TRUE);
             // SETFOCUS is sent later, after instance name command (step 10)
@@ -911,4 +918,15 @@ bool mk1_server_send_event(mk1_server_t *srv,
 bool mk1_server_is_connected(const mk1_server_t *srv)
 {
     return srv && (srv->dev_connected || srv->inst_connected);
+}
+
+// ---------------------------------------------------------------------------
+// Public: get Maschine's instance notification port name (for reconnect)
+// ---------------------------------------------------------------------------
+
+bool mk1_server_get_maschine_notif_name(const mk1_server_t *srv, char *buf, size_t len)
+{
+    if (!srv || !buf || len == 0 || !srv->maschine_inst_notif_name[0]) return false;
+    strlcpy(buf, srv->maschine_inst_notif_name, len);
+    return true;
 }

@@ -112,6 +112,6 @@ The `mk1-shim` target builds independently.
 - [x] Master Section knobs — Volume, Tempo, Swing encoder events forwarded via IPC
 - [x] Screen area encoders — all 8 encoders mapped (byte pairs confirmed from hardware capture)
 - [x] USB hot-plug — bridge survives device unplug/replug; starts before device is connected
-- [ ] Bridge reconnect — if bridge is restarted while Maschine is open, controller dead until Maschine restarts
+- [~] Bridge reconnect — sends DEVICE_OFF via saved session state to trigger Maschine re-handshake on bridge restart (under test)
 - [ ] launchd agent plist
 - [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)

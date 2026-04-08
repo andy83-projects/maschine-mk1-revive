@@ -42,3 +42,8 @@ bool mk1_server_send_event(mk1_server_t *srv,
 
 // Returns true after software has completed PID Connect + ACK
 bool mk1_server_is_connected(const mk1_server_t *srv);
+
+// Returns Maschine's instance notification port name after a full instance handshake.
+// Used by the reconnect mechanism: a restarted bridge reads this from disk and sends
+// DEVICE_OFF to the old port so Maschine re-initiates the NIHWMainHandler handshake.
+bool mk1_server_get_maschine_notif_name(const mk1_server_t *srv, char *buf, size_t len);

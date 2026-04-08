@@ -1057,6 +1057,8 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
 
         if (chosen_delta != 0) {
             float normalized = (float)chosen_delta / 255.0f;
+            fprintf(stderr, "[mk1-usb] knob %s raw_delta=%d normalized=%.4f\n",
+                    knob_map[i].name, (int)chosen_delta, (double)normalized);
             mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
         }
     }
@@ -1119,6 +1121,15 @@ static void mk1_device_process_ep1_button_packet(mk1_device_t *dev,
     if (len == 33 && data[0] == 0x02) {
         mk1_process_ep1_len33_buttons(dev, data);
         return;
+    }
+
+    // Log unrecognized EP1 packets so we can identify encoder/knob report formats.
+    static uint8_t last_unrecog[33];
+    static size_t  last_unrecog_len = 0;
+    if (len != last_unrecog_len || memcmp(data, last_unrecog, len < 33 ? len : 33) != 0) {
+        fprintf(stderr, "[mk1-usb] EP1 unrecognized len=%zu byte0=0x%02x\n", len, data[0]);
+        last_unrecog_len = len < 33 ? len : 33;
+        memcpy(last_unrecog, data, last_unrecog_len);
     }
 }
 

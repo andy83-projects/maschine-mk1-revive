@@ -467,7 +467,9 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
     bridge_t *br = (bridge_t *)ctx;
     if (!br->srv || !mk1_server_is_connected(br->srv)) return;
 
-    BTNLOG("button event len=%zu", ev->len);
+    uint32_t msg_type = 0;
+    if (ev->len >= 4) memcpy(&msg_type, ev->raw, 4);
+    BTNLOG("button event len=%zu type=0x%08x", ev->len, msg_type);
 
     mk1_server_send_event(br->srv, ev->raw, ev->len);
 }

@@ -36,7 +36,7 @@ prolonged use; launchd ordering for production deploy.
 
 | Step | Area | Status | Confidence | Notes |
 |------|------|--------|-----------|-------|
-| 1 | LED forwarding (`forward_led`) | **in progress** | 75% | Button LEDs confirmed working; pad LEDs unconfirmed — awaiting EP1 log with new build |
+| 1 | LED forwarding (`forward_led`) | **completed** | 90% | Button, group, transport, and pad LEDs now light; remaining visual issue is display backlight flicker |
 | 2 | USB hot-plug | not started | 72% | None |
 | 3 | Capture IPC DISPLAY message format | not started | 45% | `IPC_DISPLAY_HDR_LEN = 16` unverified |
 | 4 | LCD display forwarding (`forward_display`) | partial | 45% | Display init lights up; pixel forwarding unverified |

@@ -1374,9 +1374,16 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
 
     // Some 64-byte EP4 reports are not pad pressure. The non-pad button/encoder
     // state trace we captured is a duplicated 16-word scan table that steps by
-    // 0x1000 each slot. Ignore those for now so we don't misclassify them as
-    // pads or forward malformed BTN_DATA payloads into Maschine.
+    // 0x1000 each slot. These ARE the resting-state pad values (pair K = K*0x1000).
+    // Use the first scan-table report to set the per-pad resting baseline so that
+    // subsequent pressure reports don't produce false hit_on events at startup.
     if (mk1_is_scanned_button_report(data, len)) {
+        if (len == 64 && !dev->pad_baseline_set) {
+            for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
+                dev->pad_baseline[i] = read_le16(data + (i * 2));
+            }
+            dev->pad_baseline_set = true;
+        }
         log_scan_report(reader, data, len);
         return;
     }

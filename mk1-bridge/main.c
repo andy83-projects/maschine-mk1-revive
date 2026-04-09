@@ -814,6 +814,14 @@ static bool device_open_and_init(bridge_t *br)
         BLOG("WARNING: hardware init failed after arrival");
     }
 
+    // Turn on display backlight. The init sequence clears DIMM_LEDS to all zeros
+    // (phys[0] = 0 = backlight off). Sending phys[0] = 0x1e here restores the
+    // backlight before showing the status screen.
+    {
+        uint8_t bl[33] = { 0x0c, 0x1e }; // cmd=0x0c, phys[0]=0x1e, rest=0
+        mk1_device_write_endpoint(br->usb, 0x01, bl, sizeof(bl));
+    }
+
     if (!mk1_device_start(br->usb, on_pad, on_button, br)) {
         BLOG("WARNING: could not start USB read thread after arrival");
     }
@@ -927,6 +935,9 @@ int main(int argc, char **argv)
     mk1_hotplug_stop(g_bridge.hotplug);
     mk1_server_stop(g_bridge.srv);
     if (g_bridge.usb) {
+        // Clear all LEDs (including backlight at phys[0]) before closing.
+        uint8_t leds_off[33] = { 0x0c }; // cmd=0x0c, all phys positions = 0
+        mk1_device_write_endpoint(g_bridge.usb, 0x01, leds_off, sizeof(leds_off));
         mk1_device_stop(g_bridge.usb);
         mk1_device_close(g_bridge.usb);
     }

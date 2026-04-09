@@ -139,8 +139,8 @@ static void try_maschine_reconnect(void)
     char notif_name[256] = {0};
     if (!load_session_state(notif_name, sizeof(notif_name))) return;
 
-    // Check if Maschine is running.
-    FILE *pg = popen("pgrep -x Maschine 2>/dev/null", "r");
+    // Check if Maschine is running ("Maschine 2" on current NI installs).
+    FILE *pg = popen("pgrep -x 'Maschine 2' 2>/dev/null", "r");
     if (!pg) return;
     char pid_line[32] = {0};
     bool running = (fgets(pid_line, sizeof(pid_line), pg) != NULL && pid_line[0] != '\0');

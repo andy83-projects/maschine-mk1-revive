@@ -754,6 +754,8 @@ static void on_connect(void *ctx)
 // Filters ADC jitter at 700Hz without suppressing real aftertouch changes.
 // ~5% of full range — coarse enough to avoid flooding, fine enough to feel responsive.
 #define PAD_PRESSURE_THRESHOLD  200
+#define PAD_HIT_ON_THRESHOLD    256
+#define PAD_HIT_OFF_THRESHOLD    96
 
 static uint16_t g_prev_pressure[16]      = {0};  // for hit_on/hit_off transitions
 static uint16_t g_sent_pressure[16]      = {0};  // last pressure value forwarded via IPC
@@ -795,23 +797,26 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
         uint32_t idx      = pads[i].index;    // 0-15; pair index == IPC pad_index
         uint16_t pressure = pads[i].pressure;
         uint16_t prev     = g_prev_pressure[idx];
+        bool     was_active = prev >= PAD_HIT_OFF_THRESHOLD;
+        bool     is_active =
+            pressure >= (was_active ? PAD_HIT_OFF_THRESHOLD : PAD_HIT_ON_THRESHOLD);
 
         if (pressure == prev) continue;
 
-        float value = (pressure > 0) ? (pressure / PAD_PRESSURE_MAX) : 0.0f;
+        float value = is_active ? (pressure / PAD_PRESSURE_MAX) : 0.0f;
 
-        if (prev == 0 && pressure > 0) {
+        if (!was_active && is_active) {
             // pad struck — send hit_on then initial pressure_update
             BTNLOG("pad idx=%u hit_on pressure=%u (%.3f)", idx, pressure, (double)value);
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON,         value);
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
             g_sent_pressure[idx] = pressure;
-        } else if (prev > 0 && pressure == 0) {
+        } else if (was_active && !is_active) {
             // pad released
             BTNLOG("pad idx=%u hit_off", idx);
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_OFF, 0.0f);
             g_sent_pressure[idx] = 0;
-        } else {
+        } else if (is_active) {
             // pad held — only forward if pressure changed enough to be meaningful
             uint16_t sent = g_sent_pressure[idx];
             uint16_t delta = pressure > sent ? pressure - sent : sent - pressure;

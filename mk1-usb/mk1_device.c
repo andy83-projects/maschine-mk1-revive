@@ -540,6 +540,11 @@ static uint8_t mk1_scan_phase(const uint8_t *data, size_t len)
     return (uint8_t)((read_le16(data) >> 12) & 0x0f);
 }
 
+static uint16_t mk1_normalize_pad_word(uint16_t raw, uint8_t phase)
+{
+    return (uint16_t)(raw - ((uint16_t)(phase & 0x0f) << 12));
+}
+
 static void mk1_normalize_scan_report(const uint8_t *input, size_t len, uint8_t *output)
 {
     uint8_t phase = mk1_scan_phase(input, len);
@@ -1379,8 +1384,10 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
     // subsequent pressure reports don't produce false hit_on events at startup.
     if (mk1_is_scanned_button_report(data, len)) {
         if (len == 64 && !dev->pad_baseline_set) {
+            uint8_t phase = mk1_scan_phase(data, len);
             for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
-                dev->pad_baseline[i] = read_le16(data + (i * 2));
+                uint16_t raw = read_le16(data + (i * 2));
+                dev->pad_baseline[i] = mk1_normalize_pad_word(raw, phase);
             }
             dev->pad_baseline_set = true;
         }
@@ -1396,9 +1403,12 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
     // Pressure is reported as delta above baseline, clamped to [0, 4095].
     // This eliminates false-positive events from non-zero resting values.
     if (len == 64) {
+        uint8_t phase = mk1_scan_phase(data, len);
+
         if (!dev->pad_baseline_set) {
             for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
-                dev->pad_baseline[i] = read_le16(data + (i * 2));
+                uint16_t raw = read_le16(data + (i * 2));
+                dev->pad_baseline[i] = mk1_normalize_pad_word(raw, phase);
             }
             dev->pad_baseline_set = true;
             return;  // skip this first report; it is calibration only
@@ -1407,7 +1417,8 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
         mk1_pad_event_t pads[MK1_PAD_COUNT];
         for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
             uint16_t raw    = read_le16(data + (i * 2));
-            int32_t  delta  = (int32_t)raw - (int32_t)dev->pad_baseline[i];
+            uint16_t norm   = mk1_normalize_pad_word(raw, phase);
+            int32_t  delta  = (int32_t)norm - (int32_t)dev->pad_baseline[i];
             pads[i].index    = i;
             pads[i].pressure = (uint16_t)(delta <= 0 ? 0 : (delta > 4095 ? 4095 : delta));
         }

@@ -594,24 +594,26 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
     // Original NIHA always sends 0x1e at phys[0] in full-state packets (pcap confirmed).
     remapped[0] = 0x1e;
 
-    // Inject pad rubber LED data: logical[37+K] → phys[17+K] for K=0..15.
-    // Confirmed from led.log: logical[N+36] flashes to velocity on pad N press.
-    for (size_t k = 0; k < 16; k++) {
+    // Rubber LED data: logical[37+K] → phys[17+K] for K=0..14 (pads 1-15, 33-byte format).
+    // Frida kext capture confirmed phys[17..31] carry rubber data in 33-byte EP1 packets.
+    // Hardware does NOT respond to these positions without kext init (tested 2026-04-09).
+    // Root cause: kext likely sends an EP1 command during driver attach that enables
+    // rubber LED PWM mode. Needs further investigation (all-selector Frida capture at init).
+    for (size_t k = 0; k < 15; k++) {
         size_t src = 37 + k;
-        size_t dst = 17 + k;   // phys[17..32]
         if (src < full_len) {
-            remapped[dst] = led_logical[src];
+            remapped[17 + k] = led_logical[src];
         }
     }
 
-    // Build and send extended DIMM_LEDS (0x0c) packet on EP1:
-    // 34 bytes = command byte + phys[0..32] (33 positions, covers pad 16 rubber at phys[32])
-    uint8_t packet[34];
+    // Send 33-byte DIMM_LEDS packet matching original NIHA EP1 format.
+    // Original NIHA: [0x0c, phys[0..31]] = 33 bytes (pad 16 rubber not supported).
+    uint8_t packet[33];
     packet[0] = 0x0c;
-    memcpy(packet + 1, remapped, sizeof(remapped));
+    memcpy(packet + 1, remapped, 32);
 
     {
-        char hex[34 * 3 + 1];
+        char hex[33 * 3 + 1];
         for (size_t i = 0; i < sizeof(packet); i++) snprintf(hex + i*3, 4, "%02x ", packet[i]);
         hex[sizeof(packet) * 3] = '\0';
         LLOG("EP1 (%zu): %s", sizeof(packet), hex);

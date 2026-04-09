@@ -32,7 +32,7 @@ Working as of 2026-04-08:
 - Maschine software detects the MK1 in its controller list
 - Both displays render correctly (ST7529, EP8 bulk, 170×64 grayscale)
 - Status screen ("Open Maschine") shown on both displays at bridge start and when Maschine exits
-- Button/group/transport LEDs respond correctly; pad rubber LEDs not yet lighting up
+- Button/group/transport LEDs respond correctly; pad LEDs now light with correct pad addressing
 - Pads register velocity and pressure (EP4 64-byte reports, 12-bit ADC, IPC forwarded)
   - Pressure updates throttled to ≥5% change threshold to prevent IPC flooding at 700Hz
 - Group, transport, and screen buttons registered (EP1 short reports)
@@ -107,7 +107,7 @@ The `mk1-shim` target builds independently.
 - [x] Bridge daemon skeleton (`mk1-bridge`) — Maschine detects MK1 in controller list
 - [x] Display init (EP8, ST7529 17-command sequence; UI-mode scan direction `0xbc [0x02,0x01,0x01]`)
 - [x] LCD display pixel updates — full framebuffer composite + RAMWR; display renders correctly
-- [~] LED forwarding — button/group/transport LEDs work; pad rubber LEDs not lighting up (under investigation)
+- [x] LED forwarding — button/group/transport LEDs work; pad LEDs now light with correct addressing
 - [x] Pad input events — EP4 64-byte reports decoded; baseline from resting scan-table reports; pressure/hit-on/off forwarded
 - [x] Pad pressure throttle — updates gated at ≥200-count change to prevent 700Hz IPC flooding
 - [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded

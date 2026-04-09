@@ -97,6 +97,7 @@ typedef struct {
 
 static bridge_t g_bridge;
 static volatile int g_running = 1;
+static uint16_t g_led_pad_pressure[16]   = {0};  // live pad state used for synthetic rubber LEDs
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRunLoopGetMain()); }
 
@@ -556,6 +557,12 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         25, 26, 27, 28, 29, 30,
         31
     };
+    static const uint8_t pad_slot_by_index[16] = {
+        15, 14, 13, 12,
+        11, 10,  9,  8,
+         7,  6,  5,  4,
+         3,  2,  1,  0
+    };
 
     if (!br->usb) {
         LLOG("no USB device");
@@ -621,6 +628,43 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 
     if (!mk1_device_write_endpoint(br->usb, 0x01, packet, sizeof(packet))) {
         LLOG("EP1 write FAILED");
+    }
+
+    // Newer Maschine builds appear to send generic pad brightness scalars rather
+    // than a 16-slot rubber array. NIHA can still expand that into concrete pad
+    // LEDs because it already knows the active pads from PAD_DATA. Mirror that
+    // behavior here by synthesizing a lower-bank DIMM_LEDS write from live pad
+    // pressure state. Empirical Apple Silicon testing shows the lower bank is a
+    // straight reverse order across the 4x4 pad grid.
+    {
+        uint8_t banked[34] = {0};
+        uint8_t pad_dim = 0;
+        uint8_t pad_bright = 0;
+        bool have_active_pad = false;
+
+        if (full_len > 38) pad_dim = led_logical[38];
+        if (full_len > 39) pad_bright = led_logical[39];
+        if (pad_dim != 0 || pad_bright != 0) {
+            banked[0] = 0x0c;
+            banked[1] = 0x00;
+
+            for (size_t pad = 0; pad < 16; pad++) {
+                if (g_led_pad_pressure[pad] == 0) continue;
+                have_active_pad = true;
+                banked[2 + pad_slot_by_index[pad]] = pad_bright ? pad_bright : pad_dim;
+            }
+
+            if (have_active_pad) {
+                char hex[34 * 3 + 1];
+                for (size_t i = 0; i < sizeof(banked); i++) snprintf(hex + i * 3, 4, "%02x ", banked[i]);
+                hex[sizeof(banked) * 3] = '\0';
+                LLOG("EP1 banked pads (%zu): %s", sizeof(banked), hex);
+
+                if (!mk1_device_write_endpoint(br->usb, 0x01, banked, sizeof(banked))) {
+                    LLOG("EP1 banked pad write FAILED");
+                }
+            }
+        }
     }
 }
 
@@ -777,7 +821,10 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
             }
         }
 
-        if (idx < 16) g_prev_pressure[idx] = pressure;
+        if (idx < 16) {
+            g_prev_pressure[idx] = pressure;
+            g_led_pad_pressure[idx] = pressure;
+        }
     }
 }
 
@@ -890,6 +937,7 @@ static void on_device_removed(void *ctx)
     // Reset pad state so stale pressure readings don't linger on reconnect.
     memset(g_prev_pressure, 0, sizeof(g_prev_pressure));
     memset(g_sent_pressure, 0, sizeof(g_sent_pressure));
+    memset(g_led_pad_pressure, 0, sizeof(g_led_pad_pressure));
 }
 
 // ---------------------------------------------------------------------------

@@ -108,9 +108,19 @@ static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRun
 // running, we connect to that port and send DEVICE_OFF.  This kicks Maschine
 // out of its stale "connected" state so it retries the NIHWMainHandler
 // handshake — which now hits our freshly-registered bridge.
+//
+// Maschine's reconnect window is timing-sensitive so we retry DEVICE_OFF up
+// to 5 times at 1.5-second intervals.
 // ---------------------------------------------------------------------------
 
-#define SESSION_FILE "/tmp/mk1bridge.session"
+#define SESSION_FILE        "/tmp/mk1bridge.session"
+#define RECONNECT_MAX_TRIES 5
+#define RECONNECT_INTERVAL_MS 1500
+
+static char g_reconnect_notif_name[256];
+static int  g_reconnect_attempt = 0;
+
+static void reconnect_send_device_off(void);   // forward decl
 
 static void save_session_state(const char *notif_name)
 {
@@ -134,10 +144,62 @@ static bool load_session_state(char *buf, size_t len)
     return ok && buf[0] != '\0';
 }
 
+// Send DEVICE_OFF to Maschine's saved notification port.
+// Reschedules itself every RECONNECT_INTERVAL_MS until Maschine reconnects
+// or RECONNECT_MAX_TRIES is exhausted.
+static void reconnect_send_device_off(void)
+{
+    if (mk1_server_is_connected(g_bridge.srv)) {
+        BLOG("reconnect: Maschine connected after %d attempt(s)", g_reconnect_attempt);
+        return;
+    }
+
+    if (g_reconnect_attempt >= RECONNECT_MAX_TRIES) {
+        BLOG("reconnect: giving up after %d attempts — restart Maschine 2 manually",
+             RECONNECT_MAX_TRIES);
+        return;
+    }
+
+    g_reconnect_attempt++;
+
+    CFStringRef port_cf = CFStringCreateWithCString(NULL, g_reconnect_notif_name,
+                                                     kCFStringEncodingUTF8);
+    CFMessagePortRef port = CFMessagePortCreateRemote(NULL, port_cf);
+    CFRelease(port_cf);
+
+    if (port) {
+        // DEVICE_OFF = [NI_EVT_DEVICE_OFF(4 LE), MK1_DEVICE_ID(4 LE)]
+        uint8_t msg[8];
+        uint32_t type = NI_EVT_DEVICE_OFF;
+        uint32_t dev  = MK1_DEVICE_ID;
+        memcpy(msg,     &type, 4);
+        memcpy(msg + 4, &dev,  4);
+
+        CFDataRef payload = CFDataCreate(NULL, msg, sizeof(msg));
+        SInt32 result = CFMessagePortSendRequest(port, 0, payload, 1.0, 0.0, NULL, NULL);
+        CFRelease(payload);
+        CFRelease(port);
+
+        BLOG("reconnect: DEVICE_OFF attempt %d/%d — %s",
+             g_reconnect_attempt, RECONNECT_MAX_TRIES,
+             result == kCFMessagePortSuccess ? "sent" : "send failed");
+    } else {
+        BLOG("reconnect: notif port gone on attempt %d — retrying", g_reconnect_attempt);
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(RECONNECT_INTERVAL_MS * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        reconnect_send_device_off();
+    });
+}
+
 static void try_maschine_reconnect(void)
 {
-    char notif_name[256] = {0};
-    if (!load_session_state(notif_name, sizeof(notif_name))) return;
+    g_reconnect_attempt = 0;
+    g_reconnect_notif_name[0] = '\0';
+
+    if (!load_session_state(g_reconnect_notif_name, sizeof(g_reconnect_notif_name))) return;
 
     // Check if Maschine is running ("Maschine 2" on current NI installs).
     FILE *pg = popen("pgrep -x 'Maschine 2' 2>/dev/null", "r");
@@ -152,39 +214,10 @@ static void try_maschine_reconnect(void)
         return;
     }
 
-    BLOG("reconnect: Maschine running with stale bridge session — sending DEVICE_OFF to '%s'",
-         notif_name);
-
-    CFStringRef port_cf = CFStringCreateWithCString(NULL, notif_name, kCFStringEncodingUTF8);
-    CFMessagePortRef port = CFMessagePortCreateRemote(NULL, port_cf);
-    CFRelease(port_cf);
-
-    if (!port) {
-        BLOG("reconnect: old notif port not reachable — Maschine may have already cleaned up");
-        unlink(SESSION_FILE);
-        return;
-    }
-
-    // DEVICE_OFF = [NI_EVT_DEVICE_OFF(4 LE), MK1_DEVICE_ID(4 LE)]
-    uint8_t msg[8];
-    uint32_t type = NI_EVT_DEVICE_OFF;
-    uint32_t dev  = MK1_DEVICE_ID;
-    memcpy(msg,     &type, 4);
-    memcpy(msg + 4, &dev,  4);
-
-    CFDataRef payload = CFDataCreate(NULL, msg, sizeof(msg));
-    SInt32 result = CFMessagePortSendRequest(port, 0, payload, 1.0, 0.0, NULL, NULL);
-    CFRelease(payload);
-    CFRelease(port);
-
+    BLOG("reconnect: Maschine running with stale session, will retry DEVICE_OFF up to %d times",
+         RECONNECT_MAX_TRIES);
     unlink(SESSION_FILE);
-
-    if (result == kCFMessagePortSuccess) {
-        BLOG("reconnect: DEVICE_OFF sent — waiting for Maschine to reconnect");
-    } else {
-        BLOG("reconnect: DEVICE_OFF send failed (err=%d) — Maschine may need manual restart",
-             (int)result);
-    }
+    reconnect_send_device_off();
 }
 
 // ---------------------------------------------------------------------------

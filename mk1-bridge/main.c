@@ -223,6 +223,40 @@ static void try_maschine_reconnect(void)
 }
 
 // ---------------------------------------------------------------------------
+// Maschine process exit watcher
+//
+// Polls every 2 s with pgrep. When Maschine exits, shows the status screen.
+// Starts after the first successful Maschine connection so we don't run
+// pgrep unnecessarily before Maschine has ever been opened.
+// ---------------------------------------------------------------------------
+
+static bool g_maschine_process_running = false;
+static bool g_maschine_exit_watcher_started = false;
+static void show_status_screen(bridge_t *br);  // forward declaration
+
+static void poll_maschine_process(void)
+{
+    if (!g_running) return;
+
+    FILE *pg = popen("pgrep -x 'Maschine 2' 2>/dev/null", "r");
+    bool running = false;
+    if (pg) {
+        char buf[32] = {0};
+        running = (fgets(buf, sizeof(buf), pg) != NULL && buf[0] != '\0');
+        pclose(pg);
+    }
+
+    if (g_maschine_process_running && !running && g_bridge.usb) {
+        BLOG("Maschine exited — showing status screen");
+        show_status_screen(&g_bridge);
+    }
+    g_maschine_process_running = running;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ poll_maschine_process(); });
+}
+
+// ---------------------------------------------------------------------------
 // Display: IPC -> USB
 //
 // IPC DISPLAY message layout (confirmed from Macchina RE + bridge logs):
@@ -267,6 +301,130 @@ static void try_maschine_reconnect(void)
 
 // Per-display framebuffers — composited here, full frame always sent to hardware.
 static uint8_t g_display_fb[DISPLAY_COUNT][DISPLAY_FB_BYTES];
+
+// ---------------------------------------------------------------------------
+// Status screen — "Open Maschine" shown at startup and when Maschine exits
+//
+// Font: 5×7 pixels per glyph, scaled 3× for legibility on the 170×64 display.
+// Framebuffer: 170 bytes/row in ST7529 format (3 logical px packed into 2 bytes).
+// Logical pixel space: 255 wide × 64 tall (maps to 170 physical pixels wide).
+// ---------------------------------------------------------------------------
+
+#define STATUS_SCALE   3                              // render each font pixel at 3×3
+#define GLYPH_W        5
+#define GLYPH_H        7
+#define GLYPH_GAP      2                              // pixels between characters
+#define CHAR_STEP      (GLYPH_W * STATUS_SCALE + GLYPH_GAP)  // 17 logical px/char
+
+typedef struct { uint8_t r[7]; } mk1_glyph_t;
+
+// 5×7 bitmap font — only characters needed for status messages.
+// Each byte = one row, bit[4]=leftmost pixel, bit[0]=rightmost pixel.
+static const mk1_glyph_t g_font[128] = {
+    [' '] = {{0x00,0x00,0x00,0x00,0x00,0x00,0x00}},
+    ['M'] = {{0x11,0x1B,0x15,0x11,0x11,0x11,0x11}},
+    ['O'] = {{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}},
+    ['a'] = {{0x00,0x0E,0x01,0x0F,0x11,0x11,0x0E}},
+    ['c'] = {{0x00,0x0E,0x11,0x10,0x10,0x11,0x0E}},
+    ['e'] = {{0x00,0x0E,0x11,0x1F,0x10,0x0F,0x00}},
+    ['h'] = {{0x10,0x10,0x16,0x19,0x11,0x11,0x11}},
+    ['i'] = {{0x04,0x00,0x0C,0x04,0x04,0x04,0x0E}},
+    ['n'] = {{0x00,0x1C,0x12,0x11,0x11,0x11,0x00}},
+    ['p'] = {{0x1E,0x11,0x11,0x1E,0x10,0x10,0x00}},
+    ['s'] = {{0x00,0x0E,0x10,0x0E,0x01,0x11,0x0E}},
+};
+
+// Render up to two lines of text into the 10880-byte ST7529 framebuffer.
+static void render_status_fb(uint8_t *fb, const char *line1, const char *line2)
+{
+    // Work in 255×64 logical pixel space (one byte per pixel, 5-bit value 0x00/0x1F).
+    static uint8_t bmp[64][255];
+    memset(bmp, 0, sizeof(bmp));
+
+    const char *lines[2] = { line1, line2 };
+    int line_h  = GLYPH_H * STATUS_SCALE;   // 21
+    int n_lines = (line2 && *line2) ? 2 : 1;
+    int gap_y   = 3;
+    int total_h = n_lines * line_h + (n_lines > 1 ? gap_y : 0);
+    int start_y = (64 - total_h) / 2;
+
+    for (int li = 0; li < n_lines; li++) {
+        if (!lines[li] || !*lines[li]) continue;
+        int slen   = (int)strlen(lines[li]);
+        int text_w = slen * CHAR_STEP - GLYPH_GAP;
+        int cx     = (255 - text_w) / 2;
+        int cy     = start_y + li * (line_h + gap_y);
+
+        for (int ci = 0; ci < slen; ci++) {
+            unsigned char ch = (unsigned char)lines[li][ci];
+            const mk1_glyph_t *g = (ch < 128) ? &g_font[ch] : &g_font[' '];
+            int gx = cx + ci * CHAR_STEP;
+
+            for (int row = 0; row < GLYPH_H; row++) {
+                for (int col = 0; col < GLYPH_W; col++) {
+                    uint8_t on = (g->r[row] >> (4 - col)) & 1;
+                    uint8_t v  = on ? 0x1F : 0x00;
+                    for (int sy = 0; sy < STATUS_SCALE; sy++) {
+                        int py = cy + row * STATUS_SCALE + sy;
+                        if (py < 0 || py >= 64) continue;
+                        for (int sx = 0; sx < STATUS_SCALE; sx++) {
+                            int px = gx + col * STATUS_SCALE + sx;
+                            if (px < 0 || px >= 255) continue;
+                            bmp[py][px] = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pack 255-wide 5-bit bitmap → 170-byte ST7529 rows (3 px → 2 bytes).
+    for (int y = 0; y < 64; y++) {
+        uint8_t *row = fb + y * DISPLAY_BYTES_PER_ROW;
+        for (int gr = 0; gr < 85; gr++) {
+            uint8_t a = bmp[y][gr * 3];
+            uint8_t b = bmp[y][gr * 3 + 1];
+            uint8_t c = bmp[y][gr * 3 + 2];
+            row[gr * 2]     = (a << 3) | (b >> 2);
+            row[gr * 2 + 1] = (uint8_t)((b << 6) | c);
+        }
+    }
+}
+
+// Send a pre-rendered framebuffer to one display (EP8).
+static void send_fb_to_display(bridge_t *br, uint8_t usb_base, const uint8_t *fb)
+{
+    static const uint8_t row_cmd[3] = { 0x75, 0x00, 0x3f };
+    static const uint8_t col_cmd[3] = { 0x15, 0x00, 0x54 };
+    mk1_set_display(br->usb, usb_base, row_cmd, sizeof(row_cmd));
+    mk1_set_display(br->usb, usb_base, col_cmd, sizeof(col_cmd));
+
+    uint8_t *frame = malloc(1 + DISPLAY_FB_BYTES);
+    if (!frame) return;
+    frame[0] = ST7529_RAMWR;
+    memcpy(frame + 1, fb, DISPLAY_FB_BYTES);
+
+    size_t total = 1 + DISPLAY_FB_BYTES, offset = 0;
+    while (offset < total) {
+        size_t chunk = (total - offset) > EP8_CHUNK_MAX
+                     ? EP8_CHUNK_MAX : (total - offset);
+        uint8_t disp = (offset == 0) ? usb_base : (uint8_t)(usb_base | 0x01);
+        mk1_set_display(br->usb, disp, frame + offset, chunk);
+        offset += chunk;
+    }
+    free(frame);
+}
+
+// Render and send "Open Maschine" to both displays.
+static void show_status_screen(bridge_t *br)
+{
+    if (!br->usb) return;
+    uint8_t fb[DISPLAY_FB_BYTES];
+    render_status_fb(fb, "Open", "Maschine");
+    send_fb_to_display(br, 0x00, fb);
+    send_fb_to_display(br, 0x02, fb);
+    DLOG("status screen shown");
+}
 
 static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 {
@@ -502,6 +660,14 @@ static void on_connect(void *ctx)
         save_session_state(notif_name);
     }
 
+    // Start polling for Maschine process exit the first time it connects.
+    if (!g_maschine_exit_watcher_started) {
+        g_maschine_exit_watcher_started = true;
+        g_maschine_process_running = true;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{ poll_maschine_process(); });
+    }
+
     if (!br->usb) {
         BLOG("WARNING: no USB device — IPC-only mode");
         return;
@@ -538,7 +704,13 @@ static void on_connect(void *ctx)
 // pair 0 = pad 1 (IPC idx 0), pair 15 = pad 16 (IPC idx 15).
 // No remap needed — pair index == IPC pad_index.
 
-static uint16_t g_prev_pressure[16] = {0};
+// Minimum pressure change (out of 4095) required to forward a pressure_update event.
+// Filters ADC jitter at 700Hz without suppressing real aftertouch changes.
+// ~5% of full range — coarse enough to avoid flooding, fine enough to feel responsive.
+#define PAD_PRESSURE_THRESHOLD  200
+
+static uint16_t g_prev_pressure[16]      = {0};  // for hit_on/hit_off transitions
+static uint16_t g_sent_pressure[16]      = {0};  // last pressure value forwarded via IPC
 
 static void send_pad_record(mk1_server_t *srv,
                              uint64_t ts_ns,
@@ -583,17 +755,24 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
         float value = (pressure > 0) ? (pressure / PAD_PRESSURE_MAX) : 0.0f;
 
         if (prev == 0 && pressure > 0) {
-            // pad struck — send hit_on then pressure_update
+            // pad struck — send hit_on then initial pressure_update
             BTNLOG("pad idx=%u hit_on pressure=%u (%.3f)", idx, pressure, (double)value);
-            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON,          value);
-            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE,  value);
+            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON,         value);
+            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
+            g_sent_pressure[idx] = pressure;
         } else if (prev > 0 && pressure == 0) {
             // pad released
             BTNLOG("pad idx=%u hit_off", idx);
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_OFF, 0.0f);
+            g_sent_pressure[idx] = 0;
         } else {
-            // pressure changed while held
-            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
+            // pad held — only forward if pressure changed enough to be meaningful
+            uint16_t sent = g_sent_pressure[idx];
+            uint16_t delta = pressure > sent ? pressure - sent : sent - pressure;
+            if (delta >= PAD_PRESSURE_THRESHOLD) {
+                send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
+                g_sent_pressure[idx] = pressure;
+            }
         }
 
         if (idx < 16) g_prev_pressure[idx] = pressure;
@@ -646,6 +825,9 @@ static bool device_open_and_init(bridge_t *br)
         if (!mk1_server_send_device_on(br->srv, serial)) {
             BLOG("WARNING: DEVICE_ON send failed after arrival");
         }
+    } else {
+        // Maschine not yet connected — show prompt on both displays.
+        show_status_screen(br);
     }
     return true;
 }
@@ -697,6 +879,7 @@ static void on_device_removed(void *ctx)
 
     // Reset pad state so stale pressure readings don't linger on reconnect.
     memset(g_prev_pressure, 0, sizeof(g_prev_pressure));
+    memset(g_sent_pressure, 0, sizeof(g_sent_pressure));
 }
 
 // ---------------------------------------------------------------------------

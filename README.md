@@ -31,8 +31,10 @@ handshake with the Maschine app and direct IOKit USB bulk transfers to the hardw
 Working as of 2026-04-08:
 - Maschine software detects the MK1 in its controller list
 - Both displays render correctly (ST7529, EP8 bulk, 170×64 grayscale)
-- Most LEDs respond (buttons, groups, transport via EP1 DIMM_LEDS — pad rubber LEDs not yet correct)
+- Status screen ("Open Maschine") shown on both displays at bridge start and when Maschine exits
+- Button/group/transport LEDs respond correctly; pad rubber LEDs not yet lighting up
 - Pads register velocity and pressure (EP4 64-byte reports, 12-bit ADC, IPC forwarded)
+  - Pressure updates throttled to ≥5% change threshold to prevent IPC flooding at 700Hz
 - Group, transport, and screen buttons registered (EP1 short reports)
 - All 11 encoders forwarded: Volume, Tempo, Swing (Master Section) + 8 screen area encoders
 - USB hot-plug: bridge can start before device is connected; device can be unplugged and re-plugged
@@ -105,10 +107,12 @@ The `mk1-shim` target builds independently.
 - [x] Bridge daemon skeleton (`mk1-bridge`) — Maschine detects MK1 in controller list
 - [x] Display init (EP8, ST7529 17-command sequence; UI-mode scan direction `0xbc [0x02,0x01,0x01]`)
 - [x] LCD display pixel updates — full framebuffer composite + RAMWR; display renders correctly
-- [~] LED forwarding — button/group/transport LEDs work; pad rubber LEDs incorrect (under investigation)
-- [x] Pad input events — EP4 64-byte reports decoded; pressure, hit-on/off forwarded via IPC
+- [~] LED forwarding — button/group/transport LEDs work; pad rubber LEDs not lighting up (under investigation)
+- [x] Pad input events — EP4 64-byte reports decoded; baseline from resting scan-table reports; pressure/hit-on/off forwarded
+- [x] Pad pressure throttle — updates gated at ≥200-count change to prevent 700Hz IPC flooding
 - [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded
 - [~] Display backlight stays on — toggles briefly on certain button presses (under investigation)
+- [x] Status screen — "Open Maschine" shown on both displays at start and when Maschine exits
 - [x] Master Section knobs — Volume, Tempo, Swing encoder events forwarded via IPC
 - [x] Screen area encoders — all 8 encoders mapped (byte pairs confirmed from hardware capture)
 - [x] USB hot-plug — bridge survives device unplug/replug; starts before device is connected

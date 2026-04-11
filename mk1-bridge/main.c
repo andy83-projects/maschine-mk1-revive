@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <pthread.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 
@@ -36,8 +37,13 @@ static FILE *g_log_display = NULL;
 static FILE *g_log_buttons = NULL;
 static FILE *g_log_encoder = NULL;
 
+// When g_quiet is set (LED learn mode), only BLOG writes to stderr so the
+// terminal stays clean for the interactive prompts. All categories still
+// write to their log files as usual.
+static bool g_quiet = false;
+
 #define LOG(fp, fmt, ...) do { \
-    fprintf(stderr,  fmt "\n", ##__VA_ARGS__); \
+    if (!g_quiet) fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
     if (fp) { fprintf(fp, fmt "\n", ##__VA_ARGS__); fflush(fp); } \
 } while (0)
 
@@ -532,22 +538,29 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
 // NI_CMD_LED wire format (confirmed from bridge logs 2026-04-06):
 //   bytes[0..3]  = msg_type (NI_CMD_LED = 0x036c7500)
 //   bytes[4..7]  = led_len  (LE uint32, observed = 57)
-//   bytes[8..39] = logical[0..31]  — button/group/transport LEDs → remap via hw_by_logical
-//   bytes[44..59]= logical[36..51] — pad rubber LEDs for pads 1–16 (logical[N+36] = pad N+1)
+//   bytes[8..39] = logical[0..31]  — canonical 32-slot selector-6 payload
+//   bytes[44..59]= logical[36..51] — candidate extended pad rubber block for pads 1–16
 //                  (bytes[40..43] = logical[32..35], not used)
 //
-// EP1 DIMM_LEDS format (confirmed from usb.pcapng):
-//   [0x0c, phys[0], ..., phys[32]]  — 34 bytes total (extended for pad rubber LEDs)
-//   phys[0..16]  = button/group/transport LEDs (remapped from logical[0..31])
-//   phys[17..32] = pad rubber LEDs (logical[37+K] → phys[17+K], K=0..15)
+// EP1 DIMM_LEDS format:
+//   canonical: [0x0c, phys[0], ..., phys[31]]              — 33 bytes total
+//   extended : [0x0c, phys[0], ..., phys[32]]              — 34 bytes total
 //
-// Remap: hw_by_logical[logical_i] = physical_i
-// (ported from mk1_shim_remap_led_payload in mk1-shim/mk1_shim.c)
+// The base 32-slot remap matches mk1_shim_remap_led_payload / mk1_remap_led_payload.
+// For playback testing we can optionally append the newer direct pad block from
+// logical[37..52] onto phys[17..32] in the same packet, instead of mixing it with
+// separate live-pad synthesis writes.
 // ---------------------------------------------------------------------------
+
+static void learn_on_led(const uint8_t *logical, size_t len); // defined after run_led_probe
+static bool env_truthy(const char *name);
 
 static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 {
-    static const uint8_t hw_by_logical[32] = {
+    // Restore the full 32-slot selector-6 remap for button/group/transport LEDs.
+    // This matches the prior checked-in bridge behavior and the shim's authoritative
+    // logical-to-physical ordering. Pad LED experiments stay out of the default path.
+    static const uint8_t k_hw_by_logical[32] = {
          0,
          4,  3,  2,  1,
          8,  7,  6,  5,
@@ -557,18 +570,159 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         25, 26, 27, 28, 29, 30,
         31
     };
-    static const uint8_t pad_slot_by_index[16] = {
-        15, 14, 13, 12,
-        11, 10,  9,  8,
-         7,  6,  5,  4,
-         3,  2,  1,  0
+
+    // Apple Silicon narrow upper-slot overrides — logical[24], [28], [30] are
+    // confirmed carriers for Left, Record, and Shift button LEDs but the current
+    // linear mapping sends them to wrong physical destinations:
+    //   logical[24] -> phys[24] = SA3       (lights wrong SA button)
+    //   logical[28] -> phys[28] = LCD BL    (alters backlight instead of button)
+    //   logical[30] -> phys[30] = none      (no visible effect per probe)
+    //
+    // Iterate one entry at a time: rebuild after each change, note which wrong
+    // lights appear/disappear, then adjust the next candidate phys value.
+    //
+    //   0xFF = passthrough  — use k_hw_by_logical linear mapping (logs "active" when non-zero)
+    //   0xFE = suppress     — clear the linear phys write, do not forward
+    //   0..31 = redirect    — clear linear phys, write value to this phys index instead
+    //
+    // CURRENT EXPERIMENT (pass 1):
+    //   [28] suppressed first — phys[28]=LCD-BL is definitively wrong (0x32 would dim LCD).
+    //   Confirm: does Record's wrong button light disappear? If yes, [28] was the cause.
+    //   [24] and [30] are passthrough so their wrong lights remain visible for next pass.
+    //
+    // NEXT EXPERIMENTS to try once [28] is diagnosed:
+    //   [24]: try phys[1] (Transport Left nav arrow, confirmed by probe)
+    //   [30]: correct phys unknown — try phys[13] (Modules Right, closest match to
+    //         "Shift -> Modules Right" obs) or probe candidates above phys[27]
+    // Pass 1 results (2026-04-10):
+    //   logical[28] suppress confirmed: Record's wrong LED disappeared → phys[28]=LCD-BL was sole cause.
+    //   logical[24] passthrough showed phys[24]=Play (probe label "SA3" was wrong).
+    //   logical[30] passthrough showed phys[30]=Scene (probe label "none" was wrong).
+    //
+    // Pass 2 results (2026-04-10):
+    //   [24] → phys[5]: nothing visible — phys[5] is dead for Left on this hardware/app.
+    //   [30] → phys[17]: nothing visible — phys[17] is dead for Shift.
+    //   [28] suppressed: still confirmed.
+    //
+    // Known dead/wrong phys for upper slots:
+    //   Left:   phys[5]=dead, phys[24]=Play(wrong)
+    //   Shift:  phys[17]=dead, phys[30]=Scene(wrong)
+    //   Record: phys[28]=LCD-BL(wrong); correct phys unknown
+    //
+    // Pass 3 results (2026-04-10):
+    //   [24] → phys[23]: nothing visible — dead for Left.
+    //   [30] → phys[18]: Pattern lit — phys[18]=Pattern (wrong for Shift).
+    //
+    // Known phys identity map (upper range, Apple Silicon):
+    //   phys[17]=dead(Shift), phys[18]=Pattern, phys[23]=dead(Left),
+    //   phys[24]=Play, phys[28]=LCD-BL, phys[30]=Scene
+    //
+    // Pass 4 results (2026-04-10):
+    //   [24] → phys[22]: Select lit — phys[22]=Select (wrong for Left).
+    //   [30] → phys[19]: Pad Mode lit — phys[19]=Pad Mode (wrong for Shift).
+    //
+    // Known phys identity map (upper range, Apple Silicon):
+    //   phys[17]=dead(Shift), phys[18]=Pattern, phys[19]=Pad Mode,
+    //   phys[22]=Select, phys[23]=dead(Left), phys[24]=Play,
+    //   phys[28]=LCD-BL, phys[30]=Scene
+    //
+    // Pass 5 results (2026-04-10):
+    //   [24] → phys[21]: Duplicate lit — phys[21]=Duplicate (wrong for Left).
+    //   [30] → phys[20]: Navigate lit — phys[20]=Navigate (wrong for Shift).
+    //
+    // Known phys identity map (upper range, Apple Silicon):
+    //   phys[17]=dead, phys[18]=Pattern, phys[19]=Pad Mode, phys[20]=Navigate,
+    //   phys[21]=Duplicate, phys[22]=Select, phys[23]=dead,
+    //   phys[24]=Play, phys[28]=LCD-BL, phys[30]=Scene
+    //   phys[25..27], phys[29], phys[31] = unknown (next targets)
+    //
+    // Pass 6 results (2026-04-10):
+    //   [24] → phys[25]: Erase lit — phys[25]=Erase (wrong for Left).
+    //   [30] → phys[26]: Shift lit — phys[26]=SHIFT CONFIRMED CORRECT.
+    //
+    // Full known phys identity map (upper range, Apple Silicon):
+    //   phys[17]=dead, phys[18]=Pattern, phys[19]=Pad Mode, phys[20]=Navigate,
+    //   phys[21]=Duplicate, phys[22]=Select, phys[23]=dead,
+    //   phys[24]=Play, phys[25]=Erase, phys[26]=Shift,
+    //   phys[28]=LCD-BL, phys[30]=Scene
+    //   phys[27], phys[29], phys[31] = unknown (Left and Record candidates)
+    //
+    // Pass 7 results (2026-04-10):
+    //   [24] → phys[27]: Erase lit again — phys[27]=Erase-adjacent/Restart? (wrong for Left).
+    //   [28] → phys[29]: Record lit — phys[29]=RECORD CONFIRMED CORRECT.
+    //   [30] → phys[26]: Grid lit (Shift→Grid is expected Maschine shift-hint behavior;
+    //           pass 6 confirmed "shift→shift", so phys[26]=Shift is correct).
+    //
+    // Full known phys identity map (upper range, Apple Silicon):
+    //   phys[17]=dead, phys[18]=Pattern, phys[19]=Pad Mode, phys[20]=Navigate,
+    //   phys[21]=Duplicate, phys[22]=Select, phys[23]=dead,
+    //   phys[24]=Play, phys[25]=Erase, phys[26]=Shift(CONFIRMED),
+    //   phys[27]=Erase-adj/Restart, phys[28]=LCD-BL, phys[29]=Record(CONFIRMED),
+    //   phys[30]=Scene, phys[31]=unknown (last Left candidate)
+    //
+    // Pass 8 results (2026-04-10):
+    //   [24] → phys[31]: Erase lit again. NOTE: user confirmed Erase and Left use
+    //           DIFFERENT physical LEDs — so phys[25/27/31] all light the Erase LED,
+    //           which is WRONG for Left. Left LED still not found.
+    //   [28] → phys[29]: Record lit. CONFIRMED.
+    //   [30] → phys[26]: nothing — app-state variation. phys[26]=Shift still confirmed (pass 6).
+    //
+    // Known phys identity (upper range):
+    //   phys[17]=dead, phys[18]=Pattern, phys[19]=Pad Mode, phys[20]=Navigate,
+    //   phys[21]=Duplicate, phys[22]=Select, phys[23]=dead,
+    //   phys[24]=Play, phys[25]=Erase, phys[26]=Shift(CONFIRMED),
+    //   phys[27]=Erase(alias), phys[28]=LCD-BL, phys[29]=Record(CONFIRMED),
+    //   phys[30]=Scene, phys[31]=Erase(alias)
+    // Lower range untried for [24]:
+    //   phys[4]=Restart (transport "go to start/left"), phys[20]=Navigate (already id'd above)
+    //
+    // Pass 9 results (2026-04-10): REMAP COMPLETE — all three slots confirmed.
+    //
+    //   [24] → phys[4]: Erase lit again (also lit at phys[25], [27], [31]).
+    //           Every non-dead position tried for [24] lights the Erase LED.
+    //           Conclusion: logical[24] IS the Erase LED carrier. Maschine lights
+    //           the Erase LED as a "back/undo" indicator when navigating Left —
+    //           this is intentional software behavior, not misrouting.
+    //           Left nav button's own LED is logical[8] → phys[5] (lower range).
+    //           Canonical Erase phys = phys[25]. CONFIRMED.
+    //   [28] → phys[29]: Record. CONFIRMED.
+    //   [30] → phys[26]: Shift. CONFIRMED (context/mode-dependent; fires in some
+    //           states, dark in others — expected hardware behavior).
+    //
+    // -----------------------------------------------------------------------
+    // FINAL Apple Silicon upper-slot remap (all confirmed 2026-04-10):
+    //
+    //   logical[24] → phys[25] = Erase  (Maschine lights Erase LED for Left/Back)
+    //   logical[28] → phys[29] = Record
+    //   logical[30] → phys[26] = Shift  (mode-dependent; may show dark in some states)
+    //
+    // Full upper physical range map (Apple Silicon, discovered this session):
+    //   phys[17]=Solo?,  phys[18]=Pattern,  phys[19]=Pad Mode, phys[20]=Navigate,
+    //   phys[21]=Duplicate, phys[22]=Select, phys[23]=Mute?,
+    //   phys[24]=Play,   phys[25]=Erase,    phys[26]=Shift,
+    //   phys[27]=?,      phys[28]=LCD-BL,   phys[29]=Record,
+    //   phys[30]=Scene,  phys[31]=?
+    // phys[17] and [23] are likely Solo and Mute (Pad Section buttons confirmed
+    // by user: Scene/Pattern/Pad Mode/Navigate/Duplicate/Select/Solo/Mute are
+    // all in the Pad Section to the left of the pads).
+    // -----------------------------------------------------------------------
+    static const struct {
+        uint8_t log_idx;
+        uint8_t override;   // 0xFF=passthrough, 0xFE=suppress, 0..31=redirect
+        const char *name;
+    } k_apple_upper[] = {
+        { 24,   25, "Erase"  },  // CONFIRMED phys[25]=Erase (lights for Left/Back nav)
+        { 28,   29, "Record" },  // CONFIRMED phys[29]=Record
+        { 30,   26, "Shift"  },  // CONFIRMED phys[26]=Shift (mode-dependent)
     };
+    static const int k_apple_upper_n =
+        (int)(sizeof(k_apple_upper) / sizeof(k_apple_upper[0]));
 
     if (!br->usb) {
         LLOG("no USB device");
         return;
     }
-    if (raw_len < 8 + 1) {
+    if (raw_len < 8 + 32) {
         LLOG("message too short (%zu)", raw_len);
         return;
     }
@@ -588,83 +742,119 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 
     const uint8_t *led_logical = raw_msg + 8;
     size_t full_len = raw_len - 8;
+    static bool s_have_prev = false;
+    static uint8_t s_prev_logical[57] = {0};
 
-    // Remap logical[0..31] → physical button/group/transport positions.
-    // No normalization or boost: the shim (reference) does the same, and
-    // Maschine sends 0x13/0x32/0x3f which the firmware accepts directly.
-    // phys[33] covers pad 16 rubber LED at phys[32].
-    uint8_t remapped[33] = {0};
-    size_t btn_len = full_len < 32 ? full_len : 32;
-    for (size_t i = 0; i < 32 && i < btn_len; i++) {
-        remapped[hw_by_logical[i]] = led_logical[i];
+    // Notify learn mode (no-op if not armed).
+    learn_on_led(led_logical, full_len);
+
+    if (led_len_hdr < 32 || full_len < 32) {
+        LLOG("short LED payload (hdr_len=%u raw=%zu)", led_len_hdr, full_len);
+        return;
     }
-    // Original NIHA always sends 0x1e at phys[0] in full-state packets (pcap confirmed).
-    remapped[0] = 0x1e;
 
-    // Rubber LED data: logical[37+K] → phys[17+K] for K=0..14 (pads 1-15, 33-byte format).
-    // Frida kext capture confirmed phys[17..31] carry rubber data in 33-byte EP1 packets.
-    // Hardware does NOT respond to these positions without kext init (tested 2026-04-09).
-    // Root cause: kext likely sends an EP1 command during driver attach that enables
-    // rubber LED PWM mode. Needs further investigation (all-selector Frida capture at init).
-    for (size_t k = 0; k < 15; k++) {
-        size_t src = 37 + k;
-        if (src < full_len) {
-            remapped[17 + k] = led_logical[src];
+    for (size_t i = 32; i < full_len && i < 57; i++) {
+        if (led_logical[i] == 0) continue;
+        if (i >= 37 && i <= 52) continue; // rubber pad range (logical[37..52] = pads 1..16)
+        LLOG("unresolved logical[%zu]=0x%02x", i, led_logical[i]);
+    }
+
+    if (full_len >= 32) {
+        char delta[512];
+        size_t pos = 0;
+        bool any = false;
+        const size_t cmp_len = full_len < sizeof(s_prev_logical) ? full_len : sizeof(s_prev_logical);
+
+        if (s_have_prev) {
+            for (size_t i = 0; i < cmp_len; i++) {
+                if (led_logical[i] == s_prev_logical[i]) continue;
+                int wrote = snprintf(delta + pos, sizeof(delta) - pos,
+                                     "%slogical[%zu]:%02x->%02x",
+                                     any ? " " : "",
+                                     i, s_prev_logical[i], led_logical[i]);
+                if (wrote < 0 || (size_t)wrote >= sizeof(delta) - pos) {
+                    pos = sizeof(delta) - 1;
+                    break;
+                }
+                pos += (size_t)wrote;
+                any = true;
+            }
+            if (any) {
+                LLOG("logical delta: %s", delta);
+            }
+        } else {
+            LLOG("logical delta: <initial snapshot>");
+            s_have_prev = true;
+        }
+
+        memcpy(s_prev_logical, led_logical, cmp_len);
+        if (cmp_len < sizeof(s_prev_logical)) {
+            memset(s_prev_logical + cmp_len, 0, sizeof(s_prev_logical) - cmp_len);
+        }
+        s_have_prev = true;
+    }
+
+    uint8_t remapped[33] = {0};
+    remapped[0]  = 0x1e; // control register — constant in all real NIHA full-state packets
+
+    // Apply the full selector-6 remap for logical[0..31]. Runtime button
+    // misrouting on Apple Silicon is still unresolved, so the current goal is
+    // to log per-packet logical deltas rather than suppress broad ranges.
+    for (size_t log_idx = 0; log_idx < 32 && log_idx < full_len; log_idx++) {
+        uint8_t phy_idx = k_hw_by_logical[log_idx];
+        if (phy_idx < 33) {
+            remapped[phy_idx] = led_logical[log_idx];
         }
     }
 
-    // Send 33-byte DIMM_LEDS packet matching original NIHA EP1 format.
-    // Original NIHA: [0x0c, phys[0..31]] = 33 bytes (pad 16 rubber not supported).
-    uint8_t packet[33];
+    // Apply Apple Silicon upper-slot overrides after the linear remap, so each
+    // entry can clear the linearly-written physical byte before redirecting.
+    for (int k = 0; k < k_apple_upper_n; k++) {
+        uint8_t li = k_apple_upper[k].log_idx;
+        uint8_t ov = k_apple_upper[k].override;
+        // Skip if slot is out of range or currently zero (no LED change).
+        if ((size_t)li >= full_len || led_logical[li] == 0) continue;
+
+        uint8_t old_phys = k_hw_by_logical[li];  // li < 32 guaranteed by table
+
+        if (ov == 0xFF) {
+            // passthrough — linear mapping already applied; log for correlation
+            LLOG("upper-slot active: %s logical[%u]=0x%02x -> phys[%u] (linear)",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys);
+        } else if (ov == 0xFE) {
+            // suppress — clear the linearly-written byte, do not forward
+            if (old_phys < 33) remapped[old_phys] = 0;
+            LLOG("upper-slot suppressed: %s logical[%u]=0x%02x cleared phys[%u]",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys);
+        } else {
+            // redirect — clear linear byte, write value to override phys
+            if (old_phys < 33) remapped[old_phys] = 0;
+            if (ov < 33)       remapped[ov] = led_logical[li];
+            LLOG("upper-slot redirect: %s logical[%u]=0x%02x -> phys[%u] (was phys[%u])",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)ov, (unsigned)old_phys);
+        }
+    }
+
+    // Rubber pad LEDs: mechanism not yet identified.
+    // We intentionally do not synthesize or remap pad LEDs here in the default path.
+    // phys[17..27] = Step/Control/SA1-SA8/NoteRepeat buttons (confirmed by probe sweep + user).
+    // phys[28] = LCD backlight. phys[29..31] = no visible effect.
+    // logical[37..52] contains pad brightness data from NIHA but correct phys positions unknown.
+
+    uint8_t packet[34] = {0};
     packet[0] = 0x0c;
     memcpy(packet + 1, remapped, 32);
+    size_t packet_len = 33;
 
     {
-        char hex[33 * 3 + 1];
-        for (size_t i = 0; i < sizeof(packet); i++) snprintf(hex + i*3, 4, "%02x ", packet[i]);
-        hex[sizeof(packet) * 3] = '\0';
-        LLOG("EP1 (%zu): %s", sizeof(packet), hex);
+        char hex[34 * 3 + 1];
+        for (size_t i = 0; i < packet_len; i++) snprintf(hex + i*3, 4, "%02x ", packet[i]);
+        hex[packet_len * 3] = '\0';
+        LLOG("EP1 (%zu): %s", packet_len, hex);
     }
 
-    if (!mk1_device_write_endpoint(br->usb, 0x01, packet, sizeof(packet))) {
+    if (!mk1_device_write_endpoint(br->usb, 0x01, packet, packet_len)) {
         LLOG("EP1 write FAILED");
-    }
-
-    // Newer Maschine builds appear to send generic pad brightness scalars rather
-    // than a 16-slot rubber array. NIHA can still expand that into concrete pad
-    // LEDs because it already knows the active pads from PAD_DATA. Mirror that
-    // behavior here by synthesizing a lower-bank DIMM_LEDS write from live pad
-    // pressure state. Empirical Apple Silicon testing shows the lower bank is a
-    // straight reverse order across the 4x4 pad grid.
-    {
-        uint8_t banked[34] = {0};
-        uint8_t pad_dim = 0;
-        uint8_t pad_bright = 0;
-        bool have_active_pad = false;
-
-        if (full_len > 38) pad_dim = led_logical[38];
-        if (full_len > 39) pad_bright = led_logical[39];
-        if (pad_dim != 0 || pad_bright != 0) {
-            banked[0] = 0x0c;
-            banked[1] = 0x00;
-
-            for (size_t pad = 0; pad < 16; pad++) {
-                if (g_led_pad_pressure[pad] == 0) continue;
-                have_active_pad = true;
-                banked[2 + pad_slot_by_index[pad]] = pad_bright ? pad_bright : pad_dim;
-            }
-
-            if (have_active_pad) {
-                char hex[34 * 3 + 1];
-                for (size_t i = 0; i < sizeof(banked); i++) snprintf(hex + i * 3, 4, "%02x ", banked[i]);
-                hex[sizeof(banked) * 3] = '\0';
-                LLOG("EP1 banked pads (%zu): %s", sizeof(banked), hex);
-
-                if (!mk1_device_write_endpoint(br->usb, 0x01, banked, sizeof(banked))) {
-                    LLOG("EP1 banked pad write FAILED");
-                }
-            }
-        }
     }
 }
 
@@ -684,6 +874,15 @@ static void on_cmd(uint32_t cmd_type, const uint8_t *raw_msg, size_t raw_len, vo
             break;
         default:
             BLOG("unhandled CMD 0x%08x (%zu bytes)", cmd_type, raw_len);
+            if (raw_msg && raw_len > 0) {
+                char hex[128 * 3 + 1];
+                size_t log_len = raw_len < 128 ? raw_len : 128;
+                for (size_t i = 0; i < log_len; i++) {
+                    snprintf(hex + i * 3, 4, "%02x ", raw_msg[i]);
+                }
+                hex[log_len * 3] = '\0';
+                BLOG("unhandled CMD 0x%08x payload: %s", cmd_type, hex);
+            }
             break;
     }
 }
@@ -854,6 +1053,299 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
     mk1_server_send_event(br->srv, ev->raw, ev->len);
 }
 
+static bool env_truthy(const char *name)
+{
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static int env_int_or_default(const char *name, int fallback)
+{
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (!end || *end != '\0') return fallback;
+    return (int)parsed;
+}
+
+// ---------------------------------------------------------------------------
+// LED learn mode — derives hw_by_logical from live Maschine IPC button presses
+// ---------------------------------------------------------------------------
+// Usage: MK1_LED_LEARN=1 ./mk1-bridge
+// Run normally with Maschine connected. Follow prompts: press each named
+// button on the hardware, then hit ENTER. The tool diffs logical[0..31]
+// on every IPC LED update and logs which slot changed per button press.
+// Results are written to led.log with "LEARN" prefix for easy grepping.
+// ---------------------------------------------------------------------------
+
+static const char *k_phys_label[] = {
+    "none/ctrl",      // 0
+    "Transport Left", // 1
+    "Restart",        // 2
+    "Group H",        // 3
+    "Group G",        // 4
+    "Group D",        // 5
+    "Group C",        // 6
+    "Group F",        // 7
+    "Group E",        // 8
+    "Group B",        // 9
+    "Group A",        // 10
+    "Auto Write",     // 11
+    "Snap",           // 12
+    "Modules Right",  // 13
+    "Modules Left",   // 14
+    "Sampling",       // 15
+    "Browse",         // 16
+    "Step",           // 17
+    "Control",        // 18
+    "SA8",            // 19
+    "SA7",            // 20
+    "SA6",            // 21
+    "SA5",            // 22
+    "SA4",            // 23
+    "SA3",            // 24
+    "SA2",            // 25
+    "SA1",            // 26
+    "Note Repeat",    // 27
+    "LCD BL on",      // 28
+    "LCD BL off",     // 29
+    "none",           // 30
+    "none",           // 31
+    "none",           // 32
+};
+
+typedef struct { const char *name; int phys; } learn_btn_t;
+
+// Buttons in probe order. phys = expected physical slot from CODEX probe map.
+// Group B is before Group A: pressing B lets us see A's slot turn off and B's turn on.
+// Then pressing A gives us A's slot turning on and B's turning off.
+static const learn_btn_t k_learn_seq[] = {
+    { "Group B",        9 },
+    { "Group A",       10 },
+    { "Group C",        6 },
+    { "Group D",        5 },
+    { "Group E",        8 },
+    { "Group F",        7 },
+    { "Group G",        4 },
+    { "Group H",        3 },
+    { "Auto Write",    11 },
+    { "Snap",          12 },
+    { "Modules Left",  14 },
+    { "Modules Right", 13 },
+    { "Sampling",      15 },
+    { "Browse",        16 },
+    { "Left (nav)",     1 },
+    { "Restart",        2 },
+    { "Control",       18 },
+    { "SA8",           19 },
+    { "SA7",           20 },
+    { "SA6",           21 },
+    { "SA5",           22 },
+    { "SA4",           23 },
+    { "SA3",           24 },
+    { "SA2",           25 },
+    { "SA1",           26 },
+    { "Note Repeat",   27 },
+};
+#define LEARN_COUNT (int)(sizeof(k_learn_seq)/sizeof(k_learn_seq[0]))
+
+static pthread_mutex_t g_learn_mu       = PTHREAD_MUTEX_INITIALIZER;
+static bool            g_learn_armed    = false;
+static bool            g_learn_got_upd  = false;
+static uint8_t         g_learn_prev[32] = {0};
+static uint8_t         g_learn_curr[32] = {0};
+
+// Called from forward_led on every IPC LED message (holds no lock — fast path).
+static void learn_on_led(const uint8_t *logical, size_t len)
+{
+    pthread_mutex_lock(&g_learn_mu);
+    if (!g_learn_armed) { pthread_mutex_unlock(&g_learn_mu); return; }
+
+    size_t n = len < 32 ? len : 32;
+    bool changed = false;
+    for (size_t i = 0; i < n; i++) {
+        if (logical[i] != g_learn_prev[i]) { changed = true; break; }
+    }
+    if (changed) {
+        memcpy(g_learn_curr, logical, n);
+        if (n < 32) memset(g_learn_curr + n, 0, 32 - n);
+        g_learn_got_upd = true;
+        g_learn_armed   = false;
+    }
+    pthread_mutex_unlock(&g_learn_mu);
+}
+
+// Arm capture and wait up to timeout_ms for an LED update.
+// Returns true if an update was captured.
+static bool learn_wait_update(int timeout_ms)
+{
+    for (int t = 0; t < timeout_ms / 10; t++) {
+        pthread_mutex_lock(&g_learn_mu);
+        bool got = g_learn_got_upd;
+        pthread_mutex_unlock(&g_learn_mu);
+        if (got) return true;
+        usleep(10 * 1000);
+    }
+    pthread_mutex_lock(&g_learn_mu);
+    g_learn_armed = false;
+    pthread_mutex_unlock(&g_learn_mu);
+    return false;
+}
+
+static void *learn_thread_fn(void *arg)
+{
+    (void)arg;
+    char buf[32];
+
+    FILE *tty = fopen("/dev/tty", "r+");
+    if (!tty) tty = stderr;
+
+    fprintf(tty, "\n[learn] starting — connect Maschine and open a project. Prompts in 10s...\n");
+    fflush(tty);
+
+    sleep(10);
+
+    fprintf(tty,
+        "\n=== MK1 LED LEARN MODE ===\n"
+        "For each button: press it (and release), then hit ENTER.\n"
+        "Each result shows what changed vs the previous button's state.\n"
+        "Results go to led.log (grep LEARN).\n\n");
+    fflush(tty);
+
+    // Capture real initial LED state as baseline before any button presses.
+    // Arm immediately — Maschine will send a full-state update on connect/project load.
+    pthread_mutex_lock(&g_learn_mu);
+    memset(g_learn_curr, 0, 32);
+    g_learn_got_upd = false;
+    g_learn_armed   = true;
+    pthread_mutex_unlock(&g_learn_mu);
+
+    fprintf(tty, "[baseline] waiting for Maschine LED state (up to 5s)...\n");
+    fflush(tty);
+    learn_wait_update(5000);
+
+    // g_learn_curr now has the real initial state (or zeros if nothing arrived).
+    // Use it as the rolling baseline.
+    uint8_t baseline[32];
+    pthread_mutex_lock(&g_learn_mu);
+    g_learn_armed = false;
+    memcpy(baseline, g_learn_curr, 32);
+    pthread_mutex_unlock(&g_learn_mu);
+
+    // Button sequence — single capture per button, diff vs rolling baseline.
+    for (int i = 0; i < LEARN_COUNT; i++) {
+        const learn_btn_t *b = &k_learn_seq[i];
+        const char *phys_name = (b->phys >= 0 && b->phys <= 32) ? k_phys_label[b->phys] : "?";
+
+        fprintf(tty, "[%2d/%2d] Press [%-14s]  then ENTER: ", i + 1, LEARN_COUNT, b->name);
+        fflush(tty);
+
+        // Arm capture before reading Enter so we don't miss updates during the press.
+        pthread_mutex_lock(&g_learn_mu);
+        g_learn_got_upd = false;
+        g_learn_armed   = true;
+        pthread_mutex_unlock(&g_learn_mu);
+
+        if (!fgets(buf, sizeof(buf), tty)) break;
+
+        // Wait up to 3s for an update that differs from current baseline.
+        bool ok = learn_wait_update(3000);
+
+        uint8_t snap[32];
+        pthread_mutex_lock(&g_learn_mu);
+        g_learn_armed = false;
+        memcpy(snap, g_learn_curr, 32);
+        pthread_mutex_unlock(&g_learn_mu);
+
+        if (!ok) {
+            fprintf(tty, "  [no LED update received]\n");
+            LLOG("LEARN [%d/%d] %s: TIMEOUT", i+1, LEARN_COUNT, b->name);
+            // Don't update baseline — keep previous state.
+            continue;
+        }
+
+        // Diff snap vs rolling baseline.
+        bool any = false;
+        for (int s = 0; s < 32; s++) {
+            if (snap[s] != baseline[s]) {
+                fprintf(tty, "  logical[%2d]: 0x%02x -> 0x%02x  (expect->phys[%d]=%s)\n",
+                        s, baseline[s], snap[s], b->phys, phys_name);
+                LLOG("LEARN [%d/%d] %s: logical[%d] 0x%02x->0x%02x  expect->phys[%d]=%s",
+                     i+1, LEARN_COUNT, b->name, s, baseline[s], snap[s], b->phys, phys_name);
+                any = true;
+            }
+        }
+        if (!any) {
+            fprintf(tty, "  [no change vs previous state]\n");
+            LLOG("LEARN [%d/%d] %s: no change", i+1, LEARN_COUNT, b->name);
+        }
+
+        // This button's state becomes the baseline for the next button.
+        memcpy(baseline, snap, 32);
+    }
+
+    fprintf(tty, "\n=== LED LEARN COMPLETE — grep led.log for LEARN ===\n");
+    if (tty != stderr) fclose(tty);
+    return NULL;
+}
+
+static void run_led_probe(mk1_device_t *dev)
+{
+    const int from = env_int_or_default("MK1_LED_PROBE_FROM", 0);
+    const int to = env_int_or_default("MK1_LED_PROBE_TO", 31);
+    const useconds_t dwell_us = (useconds_t)(env_int_or_default("MK1_LED_PROBE_MS", 700) * 1000);
+    const uint8_t level = (uint8_t)env_int_or_default("MK1_LED_PROBE_LEVEL", 0x32);
+    const bool interactive = env_truthy("MK1_LED_PROBE_INTERACTIVE");
+
+    BLOG("LED probe mode: slots %d..%d level=0x%02x dwell=%u ms",
+         from, to, level, (unsigned)(dwell_us / 1000));
+
+    for (int idx = from; idx <= to; idx++) {
+        uint8_t packet[33] = {0};
+
+        if (idx < 0 || idx > 31) continue;
+
+        packet[0] = 0x0c;
+        packet[1] = 0x1e; // keep the controller-side LED engine/backlight control slot consistent
+        packet[1 + idx] = level;
+
+        {
+            char hex[33 * 3 + 1];
+            for (size_t i = 0; i < sizeof(packet); i++) snprintf(hex + i * 3, 4, "%02x ", packet[i]);
+            hex[sizeof(packet) * 3] = '\0';
+            LLOG("LED probe slot %d: %s", idx, hex);
+        }
+
+        mk1_device_write_endpoint(dev, 0x01, packet, sizeof(packet));
+        if (interactive) {
+            char note[256];
+            fprintf(stderr,
+                    "\n[probe] slot %d active. Type what lit up, then press Enter\n"
+                    "[probe] example: Group A bright | none | LCD backlight on\n> ",
+                    idx);
+            fflush(stderr);
+            if (fgets(note, sizeof(note), stdin)) {
+                size_t len = strlen(note);
+                while (len > 0 && (note[len - 1] == '\n' || note[len - 1] == '\r')) {
+                    note[--len] = '\0';
+                }
+                LLOG("LED probe slot %d observed: %s", idx, note[0] ? note : "(blank)");
+            } else {
+                LLOG("LED probe slot %d observed: <stdin closed>", idx);
+                clearerr(stdin);
+            }
+        } else {
+            usleep(dwell_us);
+        }
+    }
+
+    {
+        uint8_t packet[33] = {0x0c, 0x1e};
+        mk1_device_write_endpoint(dev, 0x01, packet, sizeof(packet));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hot-plug callbacks
 // ---------------------------------------------------------------------------
@@ -868,11 +1360,22 @@ static bool device_open_and_init(bridge_t *br)
         BLOG("WARNING: hardware init failed after arrival");
     }
 
+    // Clear both displays to black. The ST7529 controller GRAM retains whatever
+    // was last written (including garbage from a previous session or hot-plug).
+    // Maschine only repaints on a state change, so without this the display shows
+    // stale pixels until the user does something in the app.
+    {
+        static const uint8_t k_black[MK1_DISPLAY_FB_BYTES];
+        mk1_set_display(br->usb, 0x00, k_black, sizeof(k_black));
+        mk1_set_display(br->usb, 0x02, k_black, sizeof(k_black));
+    }
+
     // Turn on display backlight. The init sequence clears DIMM_LEDS to all zeros
     // (phys[0] = 0 = backlight off). Sending phys[0] = 0x1e here restores the
     // backlight before showing the status screen.
     {
-        uint8_t bl[33] = { 0x0c, 0x1e }; // cmd=0x0c, phys[0]=0x1e, rest=0
+        uint8_t bl[33] = { 0x0c, 0x1e }; // cmd=0x0c, phys[0]=0x1e ctrl-reg
+        bl[29] = 0x5c; // phys[28] = LCD backlight — constant in all real NIHA packets
         mk1_device_write_endpoint(br->usb, 0x01, bl, sizeof(bl));
     }
 
@@ -960,11 +1463,43 @@ int main(int argc, char **argv)
 
     BLOG("mk1-bridge starting");
 
+    if (env_truthy("MK1_LED_PROBE")) {
+        BLOG("standalone LED probe requested");
+        g_bridge.usb = mk1_device_open();
+        if (!g_bridge.usb) {
+            BLOG("LED probe failed: could not open MK1");
+            close_logs();
+            return 1;
+        }
+        if (!mk1_device_init_hardware(g_bridge.usb)) {
+            BLOG("LED probe warning: hardware init failed");
+        }
+        if (!mk1_device_start(g_bridge.usb, on_pad, on_button, &g_bridge)) {
+            BLOG("LED probe warning: could not start USB read thread");
+        }
+        usleep(250 * 1000);
+        run_led_probe(g_bridge.usb);
+        mk1_device_stop(g_bridge.usb);
+        mk1_device_close(g_bridge.usb);
+        g_bridge.usb = NULL;
+        BLOG("LED probe complete");
+        close_logs();
+        return 0;
+    }
+
     g_bridge.srv = mk1_server_start(on_connect, on_cmd, &g_bridge);
     if (!g_bridge.srv) {
         BLOG("Failed to start IPC server");
         close_logs();
         return 1;
+    }
+
+    if (env_truthy("MK1_LED_LEARN")) {
+        g_quiet = true;
+        BLOG("LED learn mode active — suppressing verbose stderr");
+        pthread_t learn_tid;
+        pthread_create(&learn_tid, NULL, learn_thread_fn, NULL);
+        pthread_detach(learn_tid);
     }
 
     // If Maschine is already running with a stale bridge session, send DEVICE_OFF

@@ -139,6 +139,7 @@ static uint8_t mk1_normalize_led_brightness(uint8_t value);
 static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
                                              const uint8_t *data,
                                              size_t len);
+static bool mk1_verbose_io_enabled(void);
 
 static void trim_trailing_ascii_whitespace(char *text)
 {
@@ -269,6 +270,8 @@ static void log_service_path(io_service_t service, const char *plane, const char
 {
     io_string_t path = {0};
 
+    if (!mk1_verbose_io_enabled()) return;
+
     if (IORegistryEntryGetPath(service, plane, path) == kIOReturnSuccess) {
         fprintf(stderr, "[mk1-usb] %s path[%s]=%s\n", label, plane, path);
     }
@@ -286,14 +289,16 @@ static void log_usb_candidate(io_service_t service, const char *class_name)
     get_registry_string(service, CFSTR("USB Product Name"), product, sizeof(product));
     get_device_identity(service, &vendor, &product_id, serial, sizeof(serial));
 
-    fprintf(stderr,
-            "[mk1-usb] USB candidate class=%s vendor=0x%04x product=0x%04x manufacturer='%s' product='%s' serial='%s'\n",
-            class_name,
-            vendor,
-            product_id,
-            manufacturer[0] ? manufacturer : "?",
-            product[0] ? product : "?",
-            serial[0] ? serial : "?");
+    if (mk1_verbose_io_enabled()) {
+        fprintf(stderr,
+                "[mk1-usb] USB candidate class=%s vendor=0x%04x product=0x%04x manufacturer='%s' product='%s' serial='%s'\n",
+                class_name,
+                vendor,
+                product_id,
+                manufacturer[0] ? manufacturer : "?",
+                product[0] ? product : "?",
+                serial[0] ? serial : "?");
+    }
 }
 
 static const char *transfer_type_name(UInt8 transfer_type)
@@ -326,9 +331,21 @@ static void log_iokit_error(const char *label, IOReturn kr)
     fprintf(stderr, "[mk1-usb] %s failed: 0x%08x\n", label, kr);
 }
 
+static bool mk1_verbose_io_enabled(void)
+{
+    const char *value = getenv("MK1_VERBOSE_IO");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+#define USBVLOG(fmt, ...) do { \
+    if (mk1_verbose_io_enabled()) fprintf(stderr, "[mk1-usb] " fmt "\n", ##__VA_ARGS__); \
+} while (0)
+
 static void log_short_bytes(const char *label, const uint8_t *data, size_t len, size_t max_len)
 {
     size_t limit = len < max_len ? len : max_len;
+
+    if (!mk1_verbose_io_enabled()) return;
 
     fprintf(stderr, "[mk1-usb] %s:", label);
     for (size_t i = 0; i < limit; i++) {
@@ -1106,8 +1123,11 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
 
         if (chosen_delta != 0) {
             float normalized = (float)chosen_delta / 255.0f;
-            fprintf(stderr, "[mk1-usb] knob %s raw_delta=%d normalized=%.4f\n",
-                    knob_map[i].name, (int)chosen_delta, (double)normalized);
+            if (g_encoder_log) {
+                fprintf(g_encoder_log, "[mk1-usb] knob %s raw_delta=%d normalized=%.4f\n",
+                        knob_map[i].name, (int)chosen_delta, (double)normalized);
+                fflush(g_encoder_log);
+            }
             mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
         }
     }
@@ -1223,8 +1243,7 @@ static void mk1_device_handle_ep1_reply(mk1_device_t *dev,
     switch (data[0]) {
     case 0x00:
         dev->saw_device_info_reply = true;
-        fprintf(stderr,
-                "[mk1-usb] EP1 reply type=0x00 len=%zu seq=0x%02x\n",
+        USBVLOG("EP1 reply type=0x00 len=%zu seq=0x%02x",
                 len,
                 len > 1 ? data[1] : 0);
         break;
@@ -1233,17 +1252,17 @@ static void mk1_device_handle_ep1_reply(mk1_device_t *dev,
             memcpy(dev->device_spec_reply, data + 1, sizeof(dev->device_spec_reply));
             dev->have_device_spec_reply = true;
         }
-        fprintf(stderr, "[mk1-usb] EP1 reply type=0x01 len=%zu (device spec)\n", len);
+        USBVLOG("EP1 reply type=0x01 len=%zu (device spec)", len);
         break;
     case 0x14:
         if (len >= 1 + sizeof(dev->user_data_reply)) {
             memcpy(dev->user_data_reply, data + 1, sizeof(dev->user_data_reply));
             dev->have_user_data_reply = true;
         }
-        fprintf(stderr, "[mk1-usb] EP1 reply type=0x14 len=%zu (user data)\n", len);
+        USBVLOG("EP1 reply type=0x14 len=%zu (user data)", len);
         break;
     default:
-        fprintf(stderr, "[mk1-usb] EP1 reply type=0x%02x len=%zu\n", data[0], len);
+        USBVLOG("EP1 reply type=0x%02x len=%zu", data[0], len);
         break;
     }
 
@@ -1578,14 +1597,14 @@ static bool open_device_interface(mk1_device_t *dev)
         return true;
     }
 
-    fprintf(stderr, "[mk1-usb] current configuration=%u\n", configuration);
+    USBVLOG("current configuration=%u", configuration);
     if (configuration == 0) {
         kr = (*dev->device_interface)->SetConfiguration(dev->device_interface, 1);
         if (kr != kIOReturnSuccess) {
             log_iokit_error("SetConfiguration(1)", kr);
             return false;
         }
-        fprintf(stderr, "[mk1-usb] configuration set to 1\n");
+        USBVLOG("configuration set to 1");
     }
 
     return true;
@@ -1627,15 +1646,17 @@ static bool open_interface(mk1_device_t *dev)
         (*interface)->GetInterfaceSubClass(interface, &interface_subclass);
         (*interface)->GetInterfaceProtocol(interface, &interface_protocol);
 
-        fprintf(stderr,
-                "[mk1-usb] interface candidate iface=%u alt=%u class=0x%02x sub=0x%02x proto=0x%02x\n",
-                interface_number,
-                alternate_setting,
-                interface_class,
-                interface_subclass,
-                interface_protocol);
-        log_service_path(service, kIOServicePlane, "interface");
-        log_service_path(service, kIOUSBPlane, "interface");
+        if (mk1_verbose_io_enabled()) {
+            fprintf(stderr,
+                    "[mk1-usb] interface candidate iface=%u alt=%u class=0x%02x sub=0x%02x proto=0x%02x\n",
+                    interface_number,
+                    alternate_setting,
+                    interface_class,
+                    interface_subclass,
+                    interface_protocol);
+            log_service_path(service, kIOServicePlane, "interface");
+            log_service_path(service, kIOUSBPlane, "interface");
+        }
 
         if (interface_number != MK1_INTERFACE_NUMBER) {
             release_usb_interface(interface);
@@ -1666,8 +1687,7 @@ static bool open_interface(mk1_device_t *dev)
         dev->interface = fallback_interface;
         dev->interface_service = fallback_service;
         if (dev->interface) {
-            fprintf(stderr,
-                    "[mk1-usb] falling back to interface %u alt=%u and will switch to alt %u\n",
+            USBVLOG("falling back to interface %u alt=%u and will switch to alt %u",
                     MK1_INTERFACE_NUMBER,
                     fallback_alt_setting,
                     MK1_ALTERNATE_SETTING);
@@ -1704,7 +1724,7 @@ static bool open_interface(mk1_device_t *dev)
             log_iokit_error("SetAlternateInterface(1)", kr);
             return false;
         }
-        fprintf(stderr, "[mk1-usb] alternate setting switched to %u\n", MK1_ALTERNATE_SETTING);
+        USBVLOG("alternate setting switched to %u", MK1_ALTERNATE_SETTING);
     }
 
     return true;
@@ -1720,7 +1740,7 @@ static bool enumerate_pipes(mk1_device_t *dev)
         return false;
     }
 
-    fprintf(stderr, "[mk1-usb] interface has %u endpoint pipes\n", endpoint_count);
+    USBVLOG("interface has %u endpoint pipes", endpoint_count);
     dev->input_pipe_count = 0;
     dev->output_pipe_count = 0;
     memset(dev->input_pipes, 0, sizeof(dev->input_pipes));
@@ -1745,8 +1765,7 @@ static bool enumerate_pipes(mk1_device_t *dev)
             continue;
         }
 
-        fprintf(stderr,
-                "[mk1-usb] pipe=%u endpoint=%u dir=%s type=%s maxPacket=%u interval=%u\n",
+        USBVLOG("pipe=%u endpoint=%u dir=%s type=%s maxPacket=%u interval=%u",
                 pipe_ref,
                 endpoint_number,
                 direction_name(direction),
@@ -1768,19 +1787,21 @@ static bool enumerate_pipes(mk1_device_t *dev)
         }
     }
 
-    fprintf(stderr, "[mk1-usb] selected input pipes:");
-    for (UInt8 i = 0; i < dev->input_pipe_count; i++) {
-        fprintf(stderr, " %u", dev->input_pipes[i]);
-    }
-    if (dev->input_pipe_count == 0) fprintf(stderr, " <none>");
-    fprintf(stderr, "\n");
+    if (mk1_verbose_io_enabled()) {
+        fprintf(stderr, "[mk1-usb] selected input pipes:");
+        for (UInt8 i = 0; i < dev->input_pipe_count; i++) {
+            fprintf(stderr, " %u", dev->input_pipes[i]);
+        }
+        if (dev->input_pipe_count == 0) fprintf(stderr, " <none>");
+        fprintf(stderr, "\n");
 
-    fprintf(stderr, "[mk1-usb] selected output pipes:");
-    for (UInt8 i = 0; i < dev->output_pipe_count; i++) {
-        fprintf(stderr, " %u", dev->output_pipes[i]);
+        fprintf(stderr, "[mk1-usb] selected output pipes:");
+        for (UInt8 i = 0; i < dev->output_pipe_count; i++) {
+            fprintf(stderr, " %u", dev->output_pipes[i]);
+        }
+        if (dev->output_pipe_count == 0) fprintf(stderr, " <none>");
+        fprintf(stderr, "\n");
     }
-    if (dev->output_pipe_count == 0) fprintf(stderr, " <none>");
-    fprintf(stderr, "\n");
 
     for (UInt8 i = 0; i < dev->input_pipe_count; i++) {
         for (UInt8 j = i + 1; j < dev->input_pipe_count; j++) {
@@ -1866,9 +1887,9 @@ mk1_device_t *mk1_device_open(void)
     }
 
     if (dev->serial[0]) {
-        fprintf(stderr, "[mk1-usb] device opened via USB registry (serial='%s')\n", dev->serial);
+        USBVLOG("device opened via USB registry (serial='%s')", dev->serial);
     } else {
-        fprintf(stderr, "[mk1-usb] device opened via USB registry (serial unavailable)\n");
+        USBVLOG("device opened via USB registry (serial unavailable)");
     }
     if (dev->trace_reports) {
         fprintf(stderr, "[mk1-usb] raw USB report tracing enabled via MK1_USB_TRACE\n");
@@ -1990,12 +2011,14 @@ bool mk1_device_write_endpoint(mk1_device_t *dev,
         return false;
     }
 
-    fprintf(stderr,
-            "[mk1-usb] wrote endpoint 0x%02x via pipe %u (%zu bytes)\n",
-            endpoint_number,
-            pipe_ref,
-            len);
-    log_short_bytes("write payload", data, len, 64);
+    if (mk1_verbose_io_enabled()) {
+        fprintf(stderr,
+                "[mk1-usb] wrote endpoint 0x%02x via pipe %u (%zu bytes)\n",
+                endpoint_number,
+                pipe_ref,
+                len);
+        log_short_bytes("write payload", data, len, 64);
+    }
     return true;
 }
 
@@ -2005,17 +2028,17 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
     // Without this, the device stays in post-enumeration idle and never activates.
 
     if (!dev || !dev->interface || dev->output_pipe_count == 0) {
-        fprintf(stderr, "[mk1-usb] init_hardware: no output pipe available\n");
+        USBVLOG("init_hardware: no output pipe available");
         return false;
     }
 
-    fprintf(stderr, "[mk1-usb] sending caiaq init sequence\n");
+    USBVLOG("sending caiaq init sequence");
 
     // 1. GET_DEVICE_INFO (0x01) — wakes the controller, triggers device spec reply on EP1 IN
     {
         uint8_t cmd = 0x01;
         if (!mk1_device_write_endpoint(dev, 0x01, &cmd, 1)) {
-            fprintf(stderr, "[mk1-usb] init_hardware: GET_DEVICE_INFO failed\n");
+            USBVLOG("init_hardware: GET_DEVICE_INFO failed");
             return false;
         }
         mk1_device_drain_ep1_replies(dev, 20, 8);
@@ -2027,7 +2050,7 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
     {
         uint8_t auto_msg[] = { 0x0b, 0x01, 0x02, 0x05 };
         if (!mk1_device_write_endpoint(dev, 0x01, auto_msg, sizeof(auto_msg))) {
-            fprintf(stderr, "[mk1-usb] init_hardware: AUTO_MSG failed\n");
+            USBVLOG("init_hardware: AUTO_MSG failed");
             return false;
         }
         mk1_device_drain_ep1_replies(dev, 5, 4);
@@ -2041,7 +2064,7 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
         memset(leds_clear, 0, sizeof(leds_clear));
         leds_clear[0] = 0x0c;
         if (!mk1_device_write_endpoint(dev, 0x01, leds_clear, sizeof(leds_clear))) {
-            fprintf(stderr, "[mk1-usb] init_hardware: DIMM_LEDS clear failed\n");
+            USBVLOG("init_hardware: DIMM_LEDS clear failed");
             return false;
         }
         mk1_device_drain_ep1_replies(dev, 5, 4);
@@ -2080,21 +2103,9 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
         // Check if EP8 is available before sending commands
         UInt8 ep8_pipe = find_output_pipe_for_endpoint(dev, 0x08);
         if (ep8_pipe == 0) {
-            fprintf(stderr, "[mk1-usb] *** EP8 NOT AVAILABLE — display will not work ***\n");
-            fprintf(stderr, "[mk1-usb] output pipes available:");
-            for (UInt8 i = 0; i < dev->output_pipe_count; i++) {
-                UInt8 dir = 0, epnum = 0, xfer = 0;
-                UInt16 maxpkt = 0;
-                UInt8 intvl = 0;
-                if ((*dev->interface)->GetPipeProperties(dev->interface,
-                        dev->output_pipes[i], &dir, &epnum, &xfer, &maxpkt, &intvl)
-                        == kIOReturnSuccess) {
-                    fprintf(stderr, " EP%u(pipe=%u,max=%u)", epnum, dev->output_pipes[i], maxpkt);
-                }
-            }
-            fprintf(stderr, "\n");
+            USBVLOG("*** EP8 NOT AVAILABLE — display will not work ***");
         } else {
-            fprintf(stderr, "[mk1-usb] EP8 found (pipe=%u) — initializing displays\n", ep8_pipe);
+            USBVLOG("EP8 found (pipe=%u) — initializing displays", ep8_pipe);
         }
 
         // Send init commands to both displays (0x00=left, 0x02=right)
@@ -2109,11 +2120,10 @@ bool mk1_device_init_hardware(mk1_device_t *dev)
             }
         }
 
-        fprintf(stderr, "[mk1-usb] display init: %zu OK, %zu FAILED (sent to both displays)\n",
-                ep8_ok, ep8_fail);
+        USBVLOG("display init: %zu OK, %zu FAILED (sent to both displays)", ep8_ok, ep8_fail);
     }
 
-    fprintf(stderr, "[mk1-usb] caiaq init sequence complete — device should be active\n");
+    USBVLOG("caiaq init sequence complete — device should be active");
     return true;
 }
 
@@ -2148,11 +2158,11 @@ bool mk1_device_replay_startup_init(mk1_device_t *dev)
     };
 
     if (!dev || !dev->interface || dev->output_pipe_count == 0) {
-        fprintf(stderr, "[mk1-usb] startup init unavailable: no output pipe\n");
+        USBVLOG("startup init unavailable: no output pipe");
         return false;
     }
 
-    fprintf(stderr, "[mk1-usb] replaying captured startup init (%zu packets)\n",
+    USBVLOG("replaying captured startup init (%zu packets)",
             sizeof(init_packets) / sizeof(init_packets[0]));
 
     for (size_t i = 0; i < sizeof(init_packets) / sizeof(init_packets[0]); i++) {
@@ -2160,7 +2170,7 @@ bool mk1_device_replay_startup_init(mk1_device_t *dev)
                                        init_packets[i].endpoint_number,
                                        init_packets[i].bytes,
                                        init_packets[i].len)) {
-            fprintf(stderr, "[mk1-usb] startup init stopped at packet %zu\n", i + 1);
+            USBVLOG("startup init stopped at packet %zu", i + 1);
             return false;
         }
         usleep(2000);
@@ -2170,7 +2180,7 @@ bool mk1_device_replay_startup_init(mk1_device_t *dev)
     replay_capture_file(dev, 0x08, "ep08.txt", 0, 0);
     replay_visual_cleanup(dev);
 
-    fprintf(stderr, "[mk1-usb] startup init replay complete\n");
+    USBVLOG("startup init replay complete");
     return true;
 }
 
@@ -2210,11 +2220,13 @@ bool mk1_device_start(mk1_device_t *dev,
         dev->readers[i].started = true;
     }
 
-    fprintf(stderr, "[mk1-usb] USB read loops active on");
-    for (UInt8 i = 0; i < dev->input_pipe_count; i++) {
-        fprintf(stderr, " pipe %u", dev->input_pipes[i]);
+    if (mk1_verbose_io_enabled()) {
+        fprintf(stderr, "[mk1-usb] USB read loops active on");
+        for (UInt8 i = 0; i < dev->input_pipe_count; i++) {
+            fprintf(stderr, " pipe %u", dev->input_pipes[i]);
+        }
+        fprintf(stderr, "\n");
     }
-    fprintf(stderr, "\n");
     return true;
 }
 
@@ -2700,7 +2712,7 @@ static void hotplug_arrived_cb(void *ctx, io_iterator_t iter)
         any = true;
     }
     if (any && hp->arrived_cb) {
-        fprintf(stderr, "[mk1-hotplug] MK1 arrived\n");
+        USBVLOG("hotplug: MK1 arrived");
         hp->arrived_cb(hp->ctx);
     }
 }
@@ -2715,7 +2727,7 @@ static void hotplug_removed_cb(void *ctx, io_iterator_t iter)
         any = true;
     }
     if (any && hp->removed_cb) {
-        fprintf(stderr, "[mk1-hotplug] MK1 removed\n");
+        USBVLOG("hotplug: MK1 removed");
         hp->removed_cb(hp->ctx);
     }
 }
@@ -2774,7 +2786,7 @@ mk1_hotplug_t *mk1_hotplug_start(mk1_hotplug_arrived_cb_t arrived,
     // Drain (no devices are "terminated" at startup, but required to arm).
     hotplug_removed_cb(hp, hp->removed_iter);
 
-    fprintf(stderr, "[mk1-hotplug] watching for MK1 (VID=%04x PID=%04x)\n",
+    USBVLOG("hotplug: watching for MK1 (VID=%04x PID=%04x)",
             MK1_VENDOR_ID, MK1_PRODUCT_ID);
     return hp;
 

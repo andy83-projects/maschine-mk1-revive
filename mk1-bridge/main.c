@@ -113,9 +113,13 @@ typedef struct {
 static bridge_t g_bridge;
 static volatile int g_running = 1;
 static uint16_t g_led_pad_pressure[16]   = {0};  // live pad state used for synthetic rubber LEDs
+static bool g_guided_mode_only = false;
+static int g_open_retry_budget = 0;
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRunLoopGetMain()); }
 static void maybe_start_guided_mode(bridge_t *br);
+static void schedule_device_open_retry(bridge_t *br);
+static bool guided_verify_with_maschine(void);
 
 // ---------------------------------------------------------------------------
 // Session state — for bridge reconnect while Maschine is running
@@ -566,6 +570,7 @@ static void learn_on_led(const uint8_t *logical, size_t len); // defined after r
 static void project_capture_on_led(const uint8_t *logical, size_t logical_len,
                                    const uint8_t *phys, size_t phys_len);
 static bool env_truthy(const char *name);
+static int env_int_or_default(const char *name, int fallback);
 
 typedef enum {
     MK1_LED_EVIDENCE_PROVISIONAL = 0,
@@ -742,7 +747,7 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         { 29, 0xFE, "Play (scene-row)"           },  // confirmed
         { 30, 0xFE, "TransportLeft (scene-row)"  },  // confirmed
 
-        // --- TransportRight: suppress B-pkt; A-pkt slot TBD (probe slot 30 next) ---
+        // --- TransportRight: suppress B-pkt until its visible slot is confirmed ---
         // logical[27] = TransportRight confirmed from learn 2026-04-13.
         // Was routing to B-pkt data[27] = Note Repeat hardware position (wrong).
         { 27, 0xFE, "TRight (suppress until slot confirmed)" },
@@ -753,6 +758,12 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         {  7, 0xFE, "log7"  }, {  8, 0xFF, "log8"  }, {  9, 0xFF, "log9"  },
         { 10, 0xFF, "log10" }, { 11, 0xFF, "log11" }, { 12, 0xFF, "log12" },
         { 13, 0xFF, "log13" }, { 14, 0xFF, "log14" }, { 15, 0xFF, "log15" },
+
+        // Restart is driven by logical[31]. Pressing Restart also makes Maschine
+        // assert Play, so logical[29] changes are expected collateral and should
+        // not be treated as Restart evidence. Keep this redirect after the
+        // low-range suppressions so they do not clear phys[2] after we write it.
+        { 31, 2,    "Restart" },
     };
     static const int k_apple_upper_n =
         (int)(sizeof(k_apple_upper) / sizeof(k_apple_upper[0]));
@@ -912,6 +923,37 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         }
     }
 
+    // Selected extended logical indices are now strong enough to route directly.
+    // These are outside the legacy 0..31 selector-6 range, so they are handled
+    // separately after the base remap/override pass.
+    static const struct {
+        uint8_t log_idx;
+        uint8_t phys_idx;
+        const char *name;
+    } k_extended_upper[] = {
+        { 56, 27, "Note Repeat" }, // confirmed visually in normal bridge workflow
+    };
+    for (size_t k = 0; k < sizeof(k_extended_upper) / sizeof(k_extended_upper[0]); k++) {
+        uint8_t li = k_extended_upper[k].log_idx;
+        uint8_t phys = k_extended_upper[k].phys_idx;
+        if ((size_t)li >= full_len || led_logical[li] == 0) continue;
+        if (phys < 34) remapped[phys] = led_logical[li];
+        LLOG("extended-slot redirect: %s logical[%u]=0x%02x -> phys[%u]",
+             k_extended_upper[k].name, (unsigned)li, led_logical[li], (unsigned)phys);
+    }
+
+    // TransportRight is still unresolved. Allow a runtime Packet B candidate phys
+    // slot to be tested without another source edit.
+    {
+        int tright_phys = env_int_or_default("MK1_TRANSPORT_RIGHT_B_PHYS", -1);
+        if (tright_phys >= 0 && tright_phys <= 32 &&
+            full_len > 27 && led_logical[27] != 0) {
+            remapped[tright_phys] = led_logical[27];
+            LLOG("upper-slot override: TransportRight logical[27]=0x%02x -> phys[%d]",
+                 led_logical[27], tright_phys);
+        }
+    }
+
     if (env_truthy("MK1_PROJECT_CAPTURE")) {
         for (size_t i = 1; i <= 16; i++) remapped[i] = 0;
         remapped[32] = 0;
@@ -987,6 +1029,18 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         uint8_t slot = k_scene_row[k].a_slot;
         if ((size_t)li < full_len) {
             packet_a[2 + slot] = led_logical[li];
+        }
+    }
+
+    // TransportRight is still unresolved. Allow a runtime candidate Packet A slot
+    // to be tested without another source edit.
+    {
+        int tright_slot = env_int_or_default("MK1_TRANSPORT_RIGHT_A_SLOT", -1);
+        if (tright_slot >= 0 && tright_slot <= 30 &&
+            full_len > 27 && led_logical[27] != 0) {
+            packet_a[2 + tright_slot] = led_logical[27];
+            LLOG("scene-row override: TransportRight logical[27]=0x%02x -> A slot %d",
+                 led_logical[27], tright_slot);
         }
     }
 
@@ -1612,6 +1666,8 @@ static void *project_capture_thread_fn(void *arg)
 // LED learn mode — derives hw_by_logical from live Maschine IPC button presses
 // ---------------------------------------------------------------------------
 // Usage: MK1_LED_LEARN=1 ./mk1-bridge
+// Optional: MK1_LED_LEARN_FILTER='TransportRight,Note Repeat,Restart'
+// Optional: MK1_LED_LEARN_REPEATS=2
 // Run normally with Maschine connected. Follow prompts: press each named
 // button on the hardware, then hit ENTER. The tool diffs logical[0..31]
 // on every IPC LED update and logs which slot changed per button press.
@@ -1655,6 +1711,49 @@ static const char *k_phys_label[] = {
 };
 
 typedef struct { const char *name; int phys; } learn_btn_t;
+
+static bool learn_filter_token_matches(const char *token, size_t token_len,
+                                       const char *name, int seq_index)
+{
+    while (token_len > 0 && (*token == ' ' || *token == '	')) {
+        token++;
+        token_len--;
+    }
+    while (token_len > 0 && (token[token_len - 1] == ' ' || token[token_len - 1] == '	')) {
+        token_len--;
+    }
+    if (token_len == 0) return false;
+
+    char *end = NULL;
+    long ordinal = strtol(token, &end, 10);
+    if (end && end == token + token_len && ordinal == (long)(seq_index + 1)) {
+        return true;
+    }
+
+    size_t name_len = strlen(name);
+    if (name_len != token_len) return false;
+    for (size_t i = 0; i < token_len; i++) {
+        unsigned char a = (unsigned char)token[i];
+        unsigned char b = (unsigned char)name[i];
+        if (tolower(a) != tolower(b)) return false;
+    }
+    return true;
+}
+
+static bool learn_sequence_selected(const char *filter, const learn_btn_t *btn, int seq_index)
+{
+    if (!filter || !filter[0]) return true;
+
+    const char *tok = filter;
+    while (*tok) {
+        const char *comma = strchr(tok, ',');
+        size_t len = comma ? (size_t)(comma - tok) : strlen(tok);
+        if (learn_filter_token_matches(tok, len, btn->name, seq_index)) return true;
+        if (!comma) break;
+        tok = comma + 1;
+    }
+    return false;
+}
 
 // Buttons in probe order. phys = expected physical slot from CODEX probe map.
 // Group B is before Group A: pressing B lets us see A's slot turn off and B's turn on.
@@ -1761,11 +1860,27 @@ static void *learn_thread_fn(void *arg)
 
     sleep(10);
 
+    const char *filter = getenv("MK1_LED_LEARN_FILTER");
+    const int repeats = env_int_or_default("MK1_LED_LEARN_REPEATS", 1);
+
     fprintf(tty,
         "\n=== MK1 LED LEARN MODE ===\n"
         "For each button: press it (and release), then hit ENTER.\n"
         "Each result shows what changed vs the previous button's state.\n"
-        "Results go to led.log (grep LEARN).\n\n");
+        "Results go to led.log (grep LEARN).\n");
+    if (filter && filter[0]) {
+        fprintf(tty,
+                "Filter: %s\n"
+                "Only matching button names or 1-based step numbers will run.\n",
+                filter);
+    }
+    if (repeats > 1) {
+        fprintf(tty,
+                "Repeats: %d\n"
+                "Each selected button will be prompted this many times.\n",
+                repeats);
+    }
+    fputc('\n', tty);
     fflush(tty);
 
     // Capture real initial LED state as baseline before any button presses.
@@ -1789,58 +1904,80 @@ static void *learn_thread_fn(void *arg)
     pthread_mutex_unlock(&g_learn_mu);
 
     // Button sequence — single capture per button, diff vs rolling baseline.
+    int selected = 0;
     for (int i = 0; i < LEARN_COUNT; i++) {
-        const learn_btn_t *b = &k_learn_seq[i];
-        const char *phys_name = (b->phys >= 0 && b->phys <= 32) ? k_phys_label[b->phys] : "?";
-
-        fprintf(tty, "[%2d/%2d] Press [%-14s]  then ENTER: ", i + 1, LEARN_COUNT, b->name);
-        fflush(tty);
-
-        // Arm capture before reading Enter so we don't miss updates during the press.
-        pthread_mutex_lock(&g_learn_mu);
-        g_learn_got_upd = false;
-        g_learn_armed   = true;
-        pthread_mutex_unlock(&g_learn_mu);
-
-        if (!fgets(buf, sizeof(buf), tty)) break;
-
-        // Wait up to 3s for an update that differs from current baseline.
-        bool ok = learn_wait_update(3000);
-
-        uint8_t snap[57];
-        pthread_mutex_lock(&g_learn_mu);
-        g_learn_armed = false;
-        memcpy(snap, g_learn_curr, 57);
-        pthread_mutex_unlock(&g_learn_mu);
-
-        if (!ok) {
-            fprintf(tty, "  [no LED update received]\n");
-            LLOG("LEARN [%d/%d] %s: TIMEOUT", i+1, LEARN_COUNT, b->name);
-            // Don't update baseline — keep previous state.
-            continue;
-        }
-
-        // Diff snap vs rolling baseline — full 57-byte window.
-        bool any = false;
-        for (int s = 0; s < 57; s++) {
-            if (snap[s] != baseline[s]) {
-                const char *region = (s < 32) ? "B-pkt" : (s >= 37 && s <= 52) ? "pad" : "?";
-                fprintf(tty, "  logical[%2d]: 0x%02x -> 0x%02x  (%s, expect->phys[%d]=%s)\n",
-                        s, baseline[s], snap[s], region, b->phys, phys_name);
-                LLOG("LEARN [%d/%d] %s: logical[%d] 0x%02x->0x%02x  %s expect->phys[%d]=%s",
-                     i+1, LEARN_COUNT, b->name, s, baseline[s], snap[s], region, b->phys, phys_name);
-                any = true;
-            }
-        }
-        if (!any) {
-            fprintf(tty, "  [no change vs previous state]\n");
-            LLOG("LEARN [%d/%d] %s: no change", i+1, LEARN_COUNT, b->name);
-        }
-
-        // This button's state becomes the baseline for the next button.
-        memcpy(baseline, snap, 57);
+        if (learn_sequence_selected(filter, &k_learn_seq[i], i)) selected++;
+    }
+    if (selected == 0) {
+        fprintf(tty, "[learn] filter matched no buttons: %s\n", filter ? filter : "");
+        LLOG("LEARN filter matched no buttons: %s", filter ? filter : "");
+        if (tty != stderr) fclose(tty);
+        return NULL;
     }
 
+    int total_prompts = selected * (repeats > 0 ? repeats : 1);
+    int ordinal = 0;
+    for (int i = 0; i < LEARN_COUNT; i++) {
+        const learn_btn_t *b = &k_learn_seq[i];
+        if (!learn_sequence_selected(filter, b, i)) continue;
+        const char *phys_name = (b->phys >= 0 && b->phys <= 32) ? k_phys_label[b->phys] : "?";
+
+        for (int rep = 0; rep < repeats; rep++) {
+            ordinal++;
+            fprintf(tty, "[%2d/%2d] Press [%-14s]", ordinal, total_prompts, b->name);
+            if (repeats > 1) {
+                fprintf(tty, " (%d/%d)", rep + 1, repeats);
+            }
+            fprintf(tty, "  then ENTER: ");
+            fflush(tty);
+
+            // Arm capture before reading Enter so we don't miss updates during the press.
+            pthread_mutex_lock(&g_learn_mu);
+            g_learn_got_upd = false;
+            g_learn_armed   = true;
+            pthread_mutex_unlock(&g_learn_mu);
+
+            if (!fgets(buf, sizeof(buf), tty)) goto learn_done;
+
+            // Wait up to 3s for an update that differs from current baseline.
+            bool ok = learn_wait_update(3000);
+
+            uint8_t snap[57];
+            pthread_mutex_lock(&g_learn_mu);
+            g_learn_armed = false;
+            memcpy(snap, g_learn_curr, 57);
+            pthread_mutex_unlock(&g_learn_mu);
+
+            if (!ok) {
+                fprintf(tty, "  [no LED update received]\n");
+                LLOG("LEARN [%d/%d] %s: TIMEOUT", ordinal, total_prompts, b->name);
+                // Don't update baseline — keep previous state.
+                continue;
+            }
+
+            // Diff snap vs rolling baseline — full 57-byte window.
+            bool any = false;
+            for (int s = 0; s < 57; s++) {
+                if (snap[s] != baseline[s]) {
+                    const char *region = (s < 32) ? "B-pkt" : (s >= 37 && s <= 52) ? "pad" : "?";
+                    fprintf(tty, "  logical[%2d]: 0x%02x -> 0x%02x  (%s, expect->phys[%d]=%s)\n",
+                            s, baseline[s], snap[s], region, b->phys, phys_name);
+                    LLOG("LEARN [%d/%d] %s: logical[%d] 0x%02x->0x%02x  %s expect->phys[%d]=%s",
+                         ordinal, total_prompts, b->name, s, baseline[s], snap[s], region, b->phys, phys_name);
+                    any = true;
+                }
+            }
+            if (!any) {
+                fprintf(tty, "  [no change vs previous state]\n");
+                LLOG("LEARN [%d/%d] %s: no change", ordinal, total_prompts, b->name);
+            }
+
+            // This prompt's state becomes the baseline for the next prompt.
+            memcpy(baseline, snap, 57);
+        }
+    }
+
+learn_done:
     fprintf(tty, "\n=== LED LEARN COMPLETE — grep led.log for LEARN ===\n");
     if (tty != stderr) fclose(tty);
     return NULL;
@@ -1941,6 +2078,7 @@ static void run_led_verify(mk1_device_t *dev)
     const int gap_ms = env_int_or_default("MK1_LED_VERIFY_GAP_MS", 500);
     const int startup_delay_ms = env_int_or_default("MK1_LED_VERIFY_STARTUP_DELAY_MS", 5000);
     const bool randomize = env_truthy("MK1_LED_VERIFY_RANDOMIZE");
+    const bool yes_no = env_truthy("MK1_LED_VERIFY_YN");
     FILE *tty = fopen("/dev/tty", "r+");
     if (!tty) tty = stderr;
 
@@ -1967,7 +2105,7 @@ static void run_led_verify(mk1_device_t *dev)
             "Level: 0x%02x\n"
             "Startup delay: %d ms\n\n",
             (label && label[0]) ? label : "(unlabeled)",
-            slots_env, level);
+            slots_env, level, startup_delay_ms);
     fflush(tty);
 
     if (startup_delay_ms > 0) {
@@ -2016,12 +2154,16 @@ static void run_led_verify(mk1_device_t *dev)
 
         mk1_device_write_endpoint(dev, 0x01, packet, sizeof(packet));
 
-        fprintf(tty,
-                "[verify %d/%d] %s candidate phys[%d] active.\n"
-                "Score: 1=correct 2=wrong-led 3=nothing 4=ambiguous\n> ",
+        fprintf(tty, "[verify %d/%d] %s candidate phys[%d] active.\n",
                 ordinal + 1, trial_count,
                 (label && label[0]) ? label : "LED",
                 slot);
+        if (yes_no) {
+            fprintf(tty, "Is this %s? y=yes n=no\n> ",
+                    (label && label[0]) ? label : "the target LED");
+        } else {
+            fprintf(tty, "Score: 1=correct 2=wrong-led 3=nothing 4=ambiguous\n> ");
+        }
         fflush(tty);
 
         char note[256];
@@ -2032,6 +2174,11 @@ static void run_led_verify(mk1_device_t *dev)
             break;
         }
         char score = note[0];
+        if (yes_no) {
+            if (score == 'y' || score == 'Y') score = '1';
+            else if (score == 'n' || score == 'N') score = '2';
+            else score = '4';
+        }
         switch (score) {
             case '1': score_correct[slot]++; break;
             case '2': score_wrong[slot]++; break;
@@ -2096,11 +2243,17 @@ static void *guided_mode_thread_fn(void *arg)
     return NULL;
 }
 
+static bool guided_verify_with_maschine(void)
+{
+    return env_truthy("MK1_LED_VERIFY") && env_truthy("MK1_LED_VERIFY_WITH_MASCHINE");
+}
+
 static void maybe_start_guided_mode(bridge_t *br)
 {
     if (g_aux_mode_started) return;
     if (!env_truthy("MK1_LED_PROBE") && !env_truthy("MK1_LED_VERIFY")) return;
-    if (!br || !br->usb || !br->srv || !mk1_server_is_connected(br->srv)) return;
+    if (!br || !br->usb) return;
+    if (!g_guided_mode_only && (!br->srv || !mk1_server_is_connected(br->srv))) return;
 
     g_aux_mode_started = true;
     pthread_t tid;
@@ -2156,6 +2309,7 @@ static bool device_open_and_init(bridge_t *br)
     } else {
         // Maschine not yet connected — show prompt on both displays.
         show_status_screen(br);
+        maybe_start_guided_mode(br);
     }
     return true;
 }
@@ -2170,18 +2324,43 @@ static void on_device_arrived(void *ctx)
     }
 
     BLOG("MK1 arrived — opening");
-    if (device_open_and_init(br)) return;
+    if (device_open_and_init(br)) {
+        g_open_retry_budget = 0;
+        return;
+    }
 
-    // kIOFirstMatchNotification can fire before the USB stack has finished
-    // publishing interface services. Retry once after a short delay.
-    BLOG("open failed — retrying in 500ms");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+    // On Apple Silicon the matching notification can beat the device-userclient
+    // readiness. Keep the default bridge behavior conservative, but allow a few
+    // extra retries in standalone guided mode so raw slot probes do not require
+    // further usb-open surgery.
+    g_open_retry_budget = g_guided_mode_only ? 6 : 1;
+    schedule_device_open_retry(br);
+}
+
+static void schedule_device_open_retry(bridge_t *br)
+{
+    const int retry_ms = 500;
+
+    if (!br || br->usb) {
+        g_open_retry_budget = 0;
+        return;
+    }
+    if (g_open_retry_budget <= 0) {
+        BLOG("retry failed — device not usable");
+        return;
+    }
+
+    BLOG("open failed — retrying in %dms (%d remaining)", retry_ms, g_open_retry_budget);
+    g_open_retry_budget--;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, retry_ms * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
-        if (br->usb) return; // arrived again while we were waiting
+        if (!g_running || br->usb) return;
         BLOG("MK1 retry open");
-        if (!device_open_and_init(br)) {
-            BLOG("retry failed — device not usable");
+        if (device_open_and_init(br)) {
+            g_open_retry_budget = 0;
+            return;
         }
+        schedule_device_open_retry(br);
     });
 }
 
@@ -2226,16 +2405,17 @@ int main(int argc, char **argv)
 
     BLOG("mk1-bridge starting");
 
-    if (env_truthy("MK1_LED_PROBE") || env_truthy("MK1_LED_VERIFY")) {
+    if (env_truthy("MK1_LED_PROBE") || (env_truthy("MK1_LED_VERIFY") && !guided_verify_with_maschine())) {
+        g_guided_mode_only = true;
         g_quiet = true;
-        BLOG("guided LED test mode active — waiting for Maschine connection");
-    }
-
-    g_bridge.srv = mk1_server_start(on_connect, on_cmd, &g_bridge);
-    if (!g_bridge.srv) {
-        BLOG("Failed to start IPC server");
-        close_logs();
-        return 1;
+        BLOG("guided LED test mode active — standalone USB mode");
+    } else {
+        g_bridge.srv = mk1_server_start(on_connect, on_cmd, &g_bridge);
+        if (!g_bridge.srv) {
+            BLOG("Failed to start IPC server");
+            close_logs();
+            return 1;
+        }
     }
 
     if (env_truthy("MK1_LED_LEARN")) {
@@ -2258,8 +2438,10 @@ int main(int argc, char **argv)
     // via the saved notification port so it re-initiates the NIHWMainHandler handshake.
     // Run after a short delay to ensure our NIHWMainHandler port is fully registered
     // in bootstrap before Maschine's reconnect attempt fires.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{ try_maschine_reconnect(); });
+    if (g_bridge.srv) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{ try_maschine_reconnect(); });
+    }
 
     // Hot-plug watcher — fires immediately if device is already connected,
     // and again on any future plug/unplug while the run loop is running.
@@ -2268,16 +2450,20 @@ int main(int argc, char **argv)
         BLOG("WARNING: hot-plug watcher failed to start");
     }
 
-    maybe_launch_maschine();
+    if (!g_guided_mode_only) {
+        maybe_launch_maschine();
+    }
 
-    BLOG("waiting for MK1 and Maschine software...");
+    BLOG("waiting for %s...", g_guided_mode_only ? "MK1 hardware" : "MK1 and Maschine software");
     CFRunLoopRun();
 
-    if (g_bridge.usb && mk1_server_is_connected(g_bridge.srv)) {
+    if (g_bridge.usb && g_bridge.srv && mk1_server_is_connected(g_bridge.srv)) {
         mk1_server_send_device_off(g_bridge.srv);
     }
     mk1_hotplug_stop(g_bridge.hotplug);
-    mk1_server_stop(g_bridge.srv);
+    if (g_bridge.srv) {
+        mk1_server_stop(g_bridge.srv);
+    }
     if (g_bridge.usb) {
         // Clear all LEDs (including backlight at phys[0]) before closing.
         uint8_t leds_off[33] = { 0x0c }; // cmd=0x0c, all phys positions = 0

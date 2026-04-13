@@ -180,34 +180,34 @@ static void logger_hex_preview(const char *label, const void *data, size_t len)
     pthread_mutex_unlock(&g_log_lock);
 }
 
-static void logger_hex_line_locked(const uint8_t *bytes, size_t len)
+static void logger_hex_line_locked(FILE *fp, const uint8_t *bytes, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
-        fprintf(logger_fp(), "%02x%s", bytes[i], (i + 1u < len) ? " " : "");
+        fprintf(fp, "%02x%s", bytes[i], (i + 1u < len) ? " " : "");
     }
 }
 
-static void logger_led_delta_locked(const uint8_t *payload, size_t len)
+static void logger_led_delta_locked(FILE *fp, const uint8_t *payload, size_t len)
 {
     if (!g_last_led_payload_valid) {
-        fprintf(logger_fp(), "    logical delta: <initial snapshot>\n");
+        fprintf(fp, "    logical delta: <initial snapshot>\n");
         return;
     }
 
     bool any = false;
-    fprintf(logger_fp(), "    logical delta:");
+    fprintf(fp, "    logical delta:");
     for (size_t i = 0; i < len; i++) {
         if (g_last_led_payload[i] == payload[i]) continue;
-        fprintf(logger_fp(), " logical[%zu]:%02x->%02x",
+        fprintf(fp, " logical[%zu]:%02x->%02x",
                 i,
                 g_last_led_payload[i],
                 payload[i]);
         any = true;
     }
     if (!any) {
-        fprintf(logger_fp(), " <no change>");
+        fprintf(fp, " <no change>");
     }
-    fputc('\n', logger_fp());
+    fputc('\n', fp);
 }
 
 static void logger_led_payload(const char *call_name,
@@ -227,9 +227,9 @@ static void logger_led_payload(const char *call_name,
             call_name,
             selector,
             MK1_LED_LOGICAL_BYTES);
-    logger_hex_line_locked(payload, MK1_LED_LOGICAL_BYTES);
+    logger_hex_line_locked(fp, payload, MK1_LED_LOGICAL_BYTES);
     fputc('\n', fp);
-    logger_led_delta_locked(payload, MK1_LED_LOGICAL_BYTES);
+    logger_led_delta_locked(fp, payload, MK1_LED_LOGICAL_BYTES);
     memcpy(g_last_led_payload, payload, MK1_LED_LOGICAL_BYTES);
     g_last_led_payload_valid = true;
     fflush(fp);

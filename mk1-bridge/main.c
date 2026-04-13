@@ -1625,6 +1625,7 @@ typedef struct { const char *name; int phys; } learn_btn_t;
 // Group B is before Group A: pressing B lets us see A's slot turn off and B's turn on.
 // Then pressing A gives us A's slot turning on and B's turning off.
 static const learn_btn_t k_learn_seq[] = {
+    // offset=0x1E region (groups, transport, display buttons)
     { "Group B",        9 },
     { "Group A",       10 },
     { "Group C",        6 },
@@ -1651,14 +1652,29 @@ static const learn_btn_t k_learn_seq[] = {
     { "SA2",           25 },
     { "SA1",           26 },
     { "Note Repeat",   27 },
+    // offset=0x00 scene-row buttons (phys=-1 = unknown logical slot)
+    { "Mute",          -1 },
+    { "Solo",          -1 },
+    { "Select",        -1 },
+    { "Duplicate",     -1 },
+    { "Navigate",      -1 },
+    { "Pad Mode",      -1 },
+    { "Pattern",       -1 },
+    { "Scene",         -1 },
+    { "Shift",         -1 },
+    { "Erase",         -1 },
+    { "Grid",          -1 },
+    { "TransportLeft", -1 },
+    { "Record",        -1 },
+    { "Play",          -1 },
 };
 #define LEARN_COUNT (int)(sizeof(k_learn_seq)/sizeof(k_learn_seq[0]))
 
 static pthread_mutex_t g_learn_mu       = PTHREAD_MUTEX_INITIALIZER;
 static bool            g_learn_armed    = false;
 static bool            g_learn_got_upd  = false;
-static uint8_t         g_learn_prev[32] = {0};
-static uint8_t         g_learn_curr[32] = {0};
+static uint8_t         g_learn_prev[57] = {0};
+static uint8_t         g_learn_curr[57] = {0};
 
 // Called from forward_led on every IPC LED message (holds no lock — fast path).
 static void learn_on_led(const uint8_t *logical, size_t len)
@@ -1666,14 +1682,14 @@ static void learn_on_led(const uint8_t *logical, size_t len)
     pthread_mutex_lock(&g_learn_mu);
     if (!g_learn_armed) { pthread_mutex_unlock(&g_learn_mu); return; }
 
-    size_t n = len < 32 ? len : 32;
+    size_t n = len < 57 ? len : 57;
     bool changed = false;
     for (size_t i = 0; i < n; i++) {
         if (logical[i] != g_learn_prev[i]) { changed = true; break; }
     }
     if (changed) {
         memcpy(g_learn_curr, logical, n);
-        if (n < 32) memset(g_learn_curr + n, 0, 32 - n);
+        if (n < 57) memset(g_learn_curr + n, 0, 57 - n);
         g_learn_got_upd = true;
         g_learn_armed   = false;
     }
@@ -1731,10 +1747,10 @@ static void *learn_thread_fn(void *arg)
 
     // g_learn_curr now has the real initial state (or zeros if nothing arrived).
     // Use it as the rolling baseline.
-    uint8_t baseline[32];
+    uint8_t baseline[57];
     pthread_mutex_lock(&g_learn_mu);
     g_learn_armed = false;
-    memcpy(baseline, g_learn_curr, 32);
+    memcpy(baseline, g_learn_curr, 57);
     pthread_mutex_unlock(&g_learn_mu);
 
     // Button sequence — single capture per button, diff vs rolling baseline.
@@ -1756,10 +1772,10 @@ static void *learn_thread_fn(void *arg)
         // Wait up to 3s for an update that differs from current baseline.
         bool ok = learn_wait_update(3000);
 
-        uint8_t snap[32];
+        uint8_t snap[57];
         pthread_mutex_lock(&g_learn_mu);
         g_learn_armed = false;
-        memcpy(snap, g_learn_curr, 32);
+        memcpy(snap, g_learn_curr, 57);
         pthread_mutex_unlock(&g_learn_mu);
 
         if (!ok) {
@@ -1769,14 +1785,15 @@ static void *learn_thread_fn(void *arg)
             continue;
         }
 
-        // Diff snap vs rolling baseline.
+        // Diff snap vs rolling baseline — full 57-byte window.
         bool any = false;
-        for (int s = 0; s < 32; s++) {
+        for (int s = 0; s < 57; s++) {
             if (snap[s] != baseline[s]) {
-                fprintf(tty, "  logical[%2d]: 0x%02x -> 0x%02x  (expect->phys[%d]=%s)\n",
-                        s, baseline[s], snap[s], b->phys, phys_name);
-                LLOG("LEARN [%d/%d] %s: logical[%d] 0x%02x->0x%02x  expect->phys[%d]=%s",
-                     i+1, LEARN_COUNT, b->name, s, baseline[s], snap[s], b->phys, phys_name);
+                const char *region = (s < 32) ? "B-pkt" : (s >= 37 && s <= 52) ? "pad" : "?";
+                fprintf(tty, "  logical[%2d]: 0x%02x -> 0x%02x  (%s, expect->phys[%d]=%s)\n",
+                        s, baseline[s], snap[s], region, b->phys, phys_name);
+                LLOG("LEARN [%d/%d] %s: logical[%d] 0x%02x->0x%02x  %s expect->phys[%d]=%s",
+                     i+1, LEARN_COUNT, b->name, s, baseline[s], snap[s], region, b->phys, phys_name);
                 any = true;
             }
         }
@@ -1786,7 +1803,7 @@ static void *learn_thread_fn(void *arg)
         }
 
         // This button's state becomes the baseline for the next button.
-        memcpy(baseline, snap, 32);
+        memcpy(baseline, snap, 57);
     }
 
     fprintf(tty, "\n=== LED LEARN COMPLETE — grep led.log for LEARN ===\n");

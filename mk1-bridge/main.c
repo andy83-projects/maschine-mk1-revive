@@ -113,6 +113,9 @@ typedef struct {
 static bridge_t g_bridge;
 static volatile int g_running = 1;
 static uint16_t g_led_pad_pressure[16]   = {0};  // live pad state used for synthetic rubber LEDs
+static bool g_led_autowrite_pressed = false;
+static uint8_t g_last_led_logical[128] = {0};
+static size_t g_last_led_logical_len = 0;
 static bool g_guided_mode_only = false;
 static int g_open_retry_budget = 0;
 
@@ -120,6 +123,8 @@ static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRun
 static void maybe_start_guided_mode(bridge_t *br);
 static void schedule_device_open_retry(bridge_t *br);
 static bool guided_verify_with_maschine(void);
+static void emit_led_state(bridge_t *br, const uint8_t *led_logical, size_t full_len);
+static void refresh_led_from_cache(bridge_t *br);
 
 // ---------------------------------------------------------------------------
 // Session state — for bridge reconnect while Maschine is running
@@ -556,14 +561,13 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
 //   bytes[44..59]= logical[36..51] — candidate extended pad rubber block for pads 1–16
 //                  (bytes[40..43] = logical[32..35], not used)
 //
-// EP1 DIMM_LEDS format:
-//   canonical: [0x0c, phys[0], ..., phys[31]]              — 33 bytes total
-//   extended : [0x0c, phys[0], ..., phys[32]]              — 34 bytes total
+// EP1 DIMM_LEDS format (confirmed by CABL's MaschineMK1 implementation):
+//   Packet A: [0x0c, 0x00, device_leds[0..30]]   — 33 bytes total
+//   Packet B: [0x0c, 0x1e, device_leds[31..61]]  — 33 bytes total
 //
-// The base 32-slot remap matches mk1_shim_remap_led_payload / mk1_remap_led_payload.
-// For playback testing we can optionally append the newer direct pad block from
-// logical[37..52] onto phys[17..32] in the same packet, instead of mixing it with
-// separate live-pad synthesis writes.
+// Build one authoritative 62-slot device LED array, then slice it into the two
+// USB writes. This matches CABL's `m_leds[62]` model and avoids treating the
+// two packets as unrelated mapping domains.
 // ---------------------------------------------------------------------------
 
 static void learn_on_led(const uint8_t *logical, size_t len); // defined after run_led_probe
@@ -669,7 +673,7 @@ static bool apple_upper_has_non_passthrough_override(const void *entries_void, i
     return false;
 }
 
-static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
+static void emit_led_state(bridge_t *br, const uint8_t *led_logical, size_t full_len)
 {
     // Base linear remap for selector-6 LEDs.
     //
@@ -730,8 +734,7 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         uint8_t override;   // 0xFF=passthrough, 0xFE=suppress, 0..31=redirect
         const char *name;
     } k_apple_upper[] = {
-        // --- Scene-row buttons: suppress from B-pkt; routed to Packet A via k_scene_row ---
-        // Logical indices confirmed from LED learn pass 2026-04-12.
+        // --- Scene-row buttons: suppress from Packet B; handled in device_leds[16..29] ---
         { 16, 0xFE, "Mute (scene-row)"          },  // assumed
         { 17, 0xFE, "Solo (scene-row)"           },  // confirmed
         { 18, 0xFE, "Select (scene-row)"         },  // confirmed
@@ -747,15 +750,15 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         { 29, 0xFE, "Play (scene-row)"           },  // confirmed
         { 30, 0xFE, "TransportLeft (scene-row)"  },  // confirmed
 
-        // --- TransportRight: suppress B-pkt until its visible slot is confirmed ---
+        // --- TransportRight: suppress Packet B legacy path; handled directly at slot 27 ---
         // logical[27] = TransportRight confirmed from learn 2026-04-13.
-        // Was routing to B-pkt data[27] = Note Repeat hardware position (wrong).
+        // The base linear Packet B path lands on the wrong second-bank slot.
         { 27, 0xFE, "TRight (suppress until slot confirmed)" },
 
         // Lower-range slots observed active in project-context runs:
-        {  1, 0xFE, "log1"  }, {  2, 0xFE, "log2"  }, {  3, 0xFE, "log3"  },
-        {  4, 0xFF, "log4"  }, {  5, 0xFF, "log5"  }, {  6, 0xFE, "log6"  },
-        {  7, 0xFE, "log7"  }, {  8, 0xFF, "log8"  }, {  9, 0xFF, "log9"  },
+        {  1, 0xFF, "Group G"  }, {  2, 0xFF, "Group H"  }, {  3, 0xFE, "log3"  },
+        {  4, 0xFF, "log4"    }, {  5, 0xFF, "log5"    }, {  6, 0xFF, "Group F"  },
+        {  7, 0xFF, "Group C"  }, {  8, 0xFF, "log8"   }, {  9, 0xFF, "log9"  },
         { 10, 0xFF, "log10" }, { 11, 0xFF, "log11" }, { 12, 0xFF, "log12" },
         { 13, 0xFF, "log13" }, { 14, 0xFF, "log14" }, { 15, 0xFF, "log15" },
 
@@ -768,6 +771,222 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
     static const int k_apple_upper_n =
         (int)(sizeof(k_apple_upper) / sizeof(k_apple_upper[0]));
 
+    if (!br->usb) {
+        LLOG("no USB device");
+        return;
+    }
+
+    for (size_t i = 32; i < full_len && i < 57; i++) {
+        if (led_logical[i] == 0) continue;
+        if (i >= 37 && i <= 52) continue; // rubber pad range (logical[37..52] = pads 1..16)
+        LLOG("unresolved logical[%zu]=0x%02x", i, led_logical[i]);
+    }
+
+    uint8_t second_block[32] = {0}; // index 1..31 maps to device slots 31..61
+
+    // Route IPC logical[0..31] into the CABL-aligned second block.
+    // k_hw_by_logical[N] is the legacy second-block-relative index.
+    for (size_t log_idx = 0; log_idx < 32 && log_idx < full_len; log_idx++) {
+        uint8_t phy_idx = k_hw_by_logical[log_idx];
+        if (phy_idx == 0) continue;
+        if (phy_idx < 32) {
+            second_block[phy_idx] = led_logical[log_idx];
+        }
+    }
+
+    // Apply Apple Silicon upper-slot overrides after the linear remap, so each
+    // entry can clear the linearly-written physical byte before redirecting.
+    for (int k = 0; k < k_apple_upper_n; k++) {
+        uint8_t li = k_apple_upper[k].log_idx;
+        uint8_t ov = k_apple_upper[k].override;
+        // Skip if slot is out of range or currently zero (no LED change).
+        if ((size_t)li >= full_len || led_logical[li] == 0) continue;
+
+        uint8_t old_phys = k_hw_by_logical[li];  // li < 32 guaranteed by table
+
+        if (ov == 0xFF) {
+            if (apple_upper_has_non_passthrough_override(k_apple_upper, k_apple_upper_n, li)) {
+                continue;
+            }
+            // passthrough — linear mapping already applied; log for correlation
+            const mk1_apple_phys_label_t *phys = apple_phys_label_entry(old_phys);
+            LLOG("upper-slot active: %s logical[%u]=0x%02x -> phys[%u]%s%s%s%s%s (linear)",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys,
+                 phys ? " " : "",
+                 phys ? phys->label : "",
+                 phys ? " [" : "",
+                 phys ? apple_evidence_name(phys->evidence) : "",
+                 phys ? "]" : "");
+        } else if (ov == 0xFE) {
+            // suppress — clear the linearly-written byte, do not forward
+            if (old_phys < 32) second_block[old_phys] = 0;
+            LLOG("upper-slot suppressed: %s logical[%u]=0x%02x cleared phys[%u]",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys);
+        } else {
+            // redirect — clear linear byte, write value to override phys
+            const mk1_apple_redirect_evidence_t *claim = apple_redirect_evidence_entry(li);
+            const mk1_apple_phys_label_t *phys = apple_phys_label_entry(ov);
+            if (old_phys < 32) second_block[old_phys] = 0;
+            if (ov < 32)       second_block[ov] = led_logical[li];
+            LLOG("upper-slot redirect: %s logical[%u]=0x%02x -> phys[%u]%s%s%s%s%s (was phys[%u], %s%s%s)",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)ov,
+                 phys ? " " : "",
+                 phys ? phys->label : "",
+                 phys ? " [" : "",
+                 phys ? apple_evidence_name(phys->evidence) : "",
+                 phys ? "]" : "",
+                 (unsigned)old_phys,
+                 claim ? claim->label : "runtime-only",
+                 claim ? ", " : "",
+                 claim ? apple_evidence_name(claim->evidence) : "");
+        }
+    }
+
+    // Selected extended logical indices are now strong enough to route directly.
+    // These are outside the legacy 0..31 selector-6 range, so they are handled
+    // separately after the base remap/override pass.
+    static const struct {
+        uint8_t log_idx;
+        uint8_t phys_idx;
+        const char *name;
+    } k_extended_upper[] = {
+        { 56, 27, "Note Repeat" }, // confirmed visually in normal bridge workflow
+    };
+    for (size_t k = 0; k < sizeof(k_extended_upper) / sizeof(k_extended_upper[0]); k++) {
+        uint8_t li = k_extended_upper[k].log_idx;
+        uint8_t phys = k_extended_upper[k].phys_idx;
+        if ((size_t)li >= full_len || led_logical[li] == 0) continue;
+        if (phys < 32) second_block[phys] = led_logical[li];
+        LLOG("extended-slot redirect: %s logical[%u]=0x%02x -> phys[%u]",
+             k_extended_upper[k].name, (unsigned)li, led_logical[li], (unsigned)phys);
+    }
+
+    // TransportRight is still unresolved. Allow a runtime Packet B candidate phys
+    // slot to be tested without another source edit.
+    {
+        int tright_phys = env_int_or_default("MK1_TRANSPORT_RIGHT_B_PHYS", -1);
+        if (tright_phys >= 0 && tright_phys < 32 &&
+            full_len > 27 && led_logical[27] != 0) {
+            second_block[tright_phys] = led_logical[27];
+            LLOG("upper-slot override: TransportRight logical[27]=0x%02x -> phys[%d]",
+                 led_logical[27], tright_phys);
+        }
+    }
+
+    if (env_truthy("MK1_PROJECT_CAPTURE")) {
+        for (size_t i = 1; i <= 16; i++) second_block[i] = 0;
+        second_block[31] = 0;
+    }
+
+    uint8_t device_leds[62] = {0};
+
+    // Scene-row: logical[] index → device_leds[] slot (absolute device order).
+    static const struct { uint8_t log_idx; uint8_t dev_slot; } k_scene_row[] = {
+        { 16, 16 },  // Mute          (assumed by position)
+        { 17, 17 },  // Solo          (confirmed)
+        { 18, 18 },  // Select        (confirmed)
+        { 19, 19 },  // Duplicate     (confirmed)
+        { 20, 20 },  // Navigate      (confirmed)
+        { 21, 21 },  // Pad Mode      (confirmed)
+        { 22, 22 },  // Pattern       (confirmed)
+        { 23, 23 },  // Scene         (confirmed)
+        { 24, 24 },  // Shift         (assumed sequential)
+        { 25, 25 },  // Erase         (confirmed)
+        { 26, 26 },  // Grid          (confirmed)
+        { 27, 27 },  // TransportRight
+        { 28, 28 },  // Record        (confirmed)
+        { 29, 29 },  // Play          (confirmed)
+    };
+    static const int k_scene_row_n = (int)(sizeof(k_scene_row)/sizeof(k_scene_row[0]));
+
+    // Scene-row buttons in the first 31-slot device window.
+    for (int k = 0; k < k_scene_row_n; k++) {
+        uint8_t li = k_scene_row[k].log_idx;
+        uint8_t slot = k_scene_row[k].dev_slot;
+        if ((size_t)li < full_len) {
+            device_leds[slot] = led_logical[li];
+        }
+    }
+
+    // Copy the legacy second packet-relative data into the absolute device LED array.
+    for (int rel = 1; rel <= 31; rel++) {
+        device_leds[30 + rel] = second_block[rel];
+    }
+
+    // CABL places TransportLeft/Loop (Restart) at the start of the second window.
+    if (full_len > 30) device_leds[31] = led_logical[30];  // TransportLeft
+
+    // Apple Silicon extended slots: logical[41..56] -> device_leds[42..57]
+    // (Snap through Note Repeat). Starts at 41; the +1 offset skips Auto Write
+    // at device_leds[41] which is handled separately.
+    //
+    // Group buttons (phys[3..10] = device_leds[33..40]) are driven by
+    // logical[1..12] via k_hw_by_logical above and must NOT be touched here.
+    // Pad rubbers at logical[37..52] also must not reach group positions.
+    for (uint8_t li = 41; li <= 56 && (size_t)li < full_len; li++) {
+        uint8_t dev_slot = (li >= 41) ? (uint8_t)(li + 1) : li;
+        if (dev_slot < 62) device_leds[dev_slot] = led_logical[li];
+    }
+
+    if (g_led_autowrite_pressed) {
+        device_leds[41] = 0x32;
+    }
+
+    // Keep the display backlight asserted during normal LED traffic, matching CABL's
+    // persistent m_leds[DisplayBacklight] behavior after init.
+    device_leds[58] = 0x5c;
+
+    // TransportRight is still configurable at runtime for slot testing.
+    {
+        int tright_slot = env_int_or_default("MK1_TRANSPORT_RIGHT_A_SLOT", -1);
+        if (tright_slot >= 0 && tright_slot <= 30 &&
+            full_len > 27 && led_logical[27] != 0) {
+            device_leds[tright_slot] = led_logical[27];
+            LLOG("scene-row override: TransportRight logical[27]=0x%02x -> device slot %d",
+                 led_logical[27], tright_slot);
+        }
+    }
+
+    uint8_t capture_phys[33] = {0};
+    capture_phys[0] = 0x1e;
+    memcpy(capture_phys + 1, second_block + 1, 31);
+    project_capture_on_led(led_logical, full_len, capture_phys, 33);
+
+    uint8_t packet_a[33] = {0};
+    packet_a[0] = 0x0c;
+    packet_a[1] = 0x00;
+    memcpy(packet_a + 2, device_leds, 31);
+
+    {
+        char hex[33 * 3 + 1];
+        for (size_t i = 0; i < 33; i++) snprintf(hex + i*3, 4, "%02x ", packet_a[i]);
+        hex[33 * 3] = '\0';
+        LLOG("EP1 A offset=0x00 (33): %s", hex);
+    }
+
+    if (!mk1_device_write_endpoint(br->usb, 0x01, packet_a, 33)) {
+        LLOG("EP1 A write FAILED");
+    }
+
+    uint8_t packet_b[33] = {0};
+    packet_b[0] = 0x0c;
+    packet_b[1] = 0x1e;
+    memcpy(packet_b + 2, device_leds + 31, 31);
+
+    {
+        char hex[33 * 3 + 1];
+        for (size_t i = 0; i < 33; i++) snprintf(hex + i*3, 4, "%02x ", packet_b[i]);
+        hex[33 * 3] = '\0';
+        LLOG("EP1 B offset=0x1e (33): %s", hex);
+    }
+
+    if (!mk1_device_write_endpoint(br->usb, 0x01, packet_b, 33)) {
+        LLOG("EP1 B write FAILED");
+    }
+}
+
+static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
+{
     if (!br->usb) {
         LLOG("no USB device");
         return;
@@ -803,11 +1022,12 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         return;
     }
 
-    for (size_t i = 32; i < full_len && i < 57; i++) {
-        if (led_logical[i] == 0) continue;
-        if (i >= 37 && i <= 52) continue; // rubber pad range (logical[37..52] = pads 1..16)
-        LLOG("unresolved logical[%zu]=0x%02x", i, led_logical[i]);
+    const size_t cache_len = full_len < sizeof(g_last_led_logical) ? full_len : sizeof(g_last_led_logical);
+    memcpy(g_last_led_logical, led_logical, cache_len);
+    if (cache_len < sizeof(g_last_led_logical)) {
+        memset(g_last_led_logical + cache_len, 0, sizeof(g_last_led_logical) - cache_len);
     }
+    g_last_led_logical_len = cache_len;
 
     if (full_len >= 32) {
         char delta[512];
@@ -844,216 +1064,15 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         s_have_prev = true;
     }
 
-    // EP1 DIMM_LEDS uses an offset protocol: byte[1] is the start position in the
-    // device's LED array, and the remaining bytes are consecutive LED values from
-    // that offset.  Two packets cover the full array:
-    //
-    //   Packet A  offset=0x00 (33 bytes): device positions  0..30
-    //     pos 0..15  = pad rubber LEDs  (cabl ordering: row-reversed per row of 4)
-    //     pos 16..29 = scene-row buttons (Mute/Solo/Select/Dup/Nav/PadMode/Pattern/
-    //                  Scene/Shift/Erase/Grid/TransportLeft/Record/Play)
-    //                  ← logical[] mapping TBD; zeroed until learn pass confirms
-    //     pos 30     = unused
-    //
-    //   Packet B  offset=0x1E (34 bytes): device positions 30..62
-    //     pos 30     = unused (first data byte is position 30; nothing visible)
-    //     pos 31..46 = Group buttons, transport, browse, sampling, modules
-    //     pos 47..57 = Step, Control, SA8..SA1, Note Repeat
-    //     pos 57     = LCD backlight (driven by IPC logical[28] or kept at 0x5c)
+    emit_led_state(br, led_logical, full_len);
+}
 
-    uint8_t remapped[34] = {0};  // data for Packet B; remapped[0] becomes offset byte 0x1E
-    remapped[0] = 0x1e;          // offset byte — tells firmware: start writing at device pos 30
-
-    // Route IPC logical[0..31] into Packet B (offset=0x1E, device positions 30..61).
-    // k_hw_by_logical[N] gives the index into remapped[] for logical slot N.
-    // remapped[0] is the offset byte — skip it (phy_idx==0 guard).
-    for (size_t log_idx = 0; log_idx < 32 && log_idx < full_len; log_idx++) {
-        uint8_t phy_idx = k_hw_by_logical[log_idx];
-        if (phy_idx == 0) continue;
-        if (phy_idx < 33) {
-            remapped[phy_idx] = led_logical[log_idx];
-        }
-    }
-
-    // Apply Apple Silicon upper-slot overrides after the linear remap, so each
-    // entry can clear the linearly-written physical byte before redirecting.
-    for (int k = 0; k < k_apple_upper_n; k++) {
-        uint8_t li = k_apple_upper[k].log_idx;
-        uint8_t ov = k_apple_upper[k].override;
-        // Skip if slot is out of range or currently zero (no LED change).
-        if ((size_t)li >= full_len || led_logical[li] == 0) continue;
-
-        uint8_t old_phys = k_hw_by_logical[li];  // li < 32 guaranteed by table
-
-        if (ov == 0xFF) {
-            if (apple_upper_has_non_passthrough_override(k_apple_upper, k_apple_upper_n, li)) {
-                continue;
-            }
-            // passthrough — linear mapping already applied; log for correlation
-            const mk1_apple_phys_label_t *phys = apple_phys_label_entry(old_phys);
-            LLOG("upper-slot active: %s logical[%u]=0x%02x -> phys[%u]%s%s%s%s%s (linear)",
-                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys,
-                 phys ? " " : "",
-                 phys ? phys->label : "",
-                 phys ? " [" : "",
-                 phys ? apple_evidence_name(phys->evidence) : "",
-                 phys ? "]" : "");
-        } else if (ov == 0xFE) {
-            // suppress — clear the linearly-written byte, do not forward
-            if (old_phys < 34) remapped[old_phys] = 0;
-            LLOG("upper-slot suppressed: %s logical[%u]=0x%02x cleared phys[%u]",
-                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys);
-        } else {
-            // redirect — clear linear byte, write value to override phys
-            const mk1_apple_redirect_evidence_t *claim = apple_redirect_evidence_entry(li);
-            const mk1_apple_phys_label_t *phys = apple_phys_label_entry(ov);
-            if (old_phys < 34) remapped[old_phys] = 0;
-            if (ov < 34)       remapped[ov] = led_logical[li];
-            LLOG("upper-slot redirect: %s logical[%u]=0x%02x -> phys[%u]%s%s%s%s%s (was phys[%u], %s%s%s)",
-                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)ov,
-                 phys ? " " : "",
-                 phys ? phys->label : "",
-                 phys ? " [" : "",
-                 phys ? apple_evidence_name(phys->evidence) : "",
-                 phys ? "]" : "",
-                 (unsigned)old_phys,
-                 claim ? claim->label : "runtime-only",
-                 claim ? ", " : "",
-                 claim ? apple_evidence_name(claim->evidence) : "");
-        }
-    }
-
-    // Selected extended logical indices are now strong enough to route directly.
-    // These are outside the legacy 0..31 selector-6 range, so they are handled
-    // separately after the base remap/override pass.
-    static const struct {
-        uint8_t log_idx;
-        uint8_t phys_idx;
-        const char *name;
-    } k_extended_upper[] = {
-        { 56, 27, "Note Repeat" }, // confirmed visually in normal bridge workflow
-    };
-    for (size_t k = 0; k < sizeof(k_extended_upper) / sizeof(k_extended_upper[0]); k++) {
-        uint8_t li = k_extended_upper[k].log_idx;
-        uint8_t phys = k_extended_upper[k].phys_idx;
-        if ((size_t)li >= full_len || led_logical[li] == 0) continue;
-        if (phys < 34) remapped[phys] = led_logical[li];
-        LLOG("extended-slot redirect: %s logical[%u]=0x%02x -> phys[%u]",
-             k_extended_upper[k].name, (unsigned)li, led_logical[li], (unsigned)phys);
-    }
-
-    // TransportRight is still unresolved. Allow a runtime Packet B candidate phys
-    // slot to be tested without another source edit.
-    {
-        int tright_phys = env_int_or_default("MK1_TRANSPORT_RIGHT_B_PHYS", -1);
-        if (tright_phys >= 0 && tright_phys <= 32 &&
-            full_len > 27 && led_logical[27] != 0) {
-            remapped[tright_phys] = led_logical[27];
-            LLOG("upper-slot override: TransportRight logical[27]=0x%02x -> phys[%d]",
-                 led_logical[27], tright_phys);
-        }
-    }
-
-    if (env_truthy("MK1_PROJECT_CAPTURE")) {
-        for (size_t i = 1; i <= 16; i++) remapped[i] = 0;
-        remapped[32] = 0;
-    }
-
-    project_capture_on_led(led_logical, full_len, remapped, 33);
-
-    // --- Packet B: offset=0x1E (groups, transport, display buttons) ---
-    uint8_t packet_b[34] = {0};
-    packet_b[0] = 0x0c;
-    memcpy(packet_b + 1, remapped, 33);
-
-    {
-        char hex[34 * 3 + 1];
-        for (size_t i = 0; i < 34; i++) snprintf(hex + i*3, 4, "%02x ", packet_b[i]);
-        hex[34 * 3] = '\0';
-        LLOG("EP1 B offset=0x1e (34): %s", hex);
-    }
-
-    if (!mk1_device_write_endpoint(br->usb, 0x01, packet_b, 34)) {
-        LLOG("EP1 B write FAILED");
-    }
-
-    // --- Packet A: offset=0x00 (pad rubber LEDs + scene-row buttons) ---
-    //
-    // Pad rubber LED mapping (confirmed from offset=0x00 probe 2026-04-12):
-    //   IPC logical[37+K] (pad K+1, K=0..15) → slot (3 - K%4) + (K/4)*4
-    //   i.e. within each row of 4 pads the order is reversed: pad4,pad3,pad2,pad1
-    //
-    // Scene-row button mapping (confirmed from LED learn pass 2026-04-12):
-    //   logical[] indices map directly to device positions 16..29 in Packet A.
-    //   TransportLeft is the exception: logical[30] → slot 27 (not sequential).
-    static const uint8_t k_pad_to_slot[16] = {
-         3,  2,  1,  0,   // pads  1- 4 (logical[37..40])
-         7,  6,  5,  4,   // pads  5- 8 (logical[41..44])
-        11, 10,  9,  8,   // pads  9-12 (logical[45..48])
-        15, 14, 13, 12,   // pads 13-16 (logical[49..52])
-    };
-
-    // Scene-row: logical[] index → Packet A slot (device pos 16..29).
-    // Confirmed from LED learn pass 2026-04-12. Mute and Shift are assumed.
-    static const struct { uint8_t log_idx; uint8_t a_slot; } k_scene_row[] = {
-        { 16, 16 },  // Mute          (assumed by position)
-        { 17, 17 },  // Solo          (confirmed)
-        { 18, 18 },  // Select        (confirmed)
-        { 19, 19 },  // Duplicate     (confirmed)
-        { 20, 20 },  // Navigate      (confirmed)
-        { 21, 21 },  // Pad Mode      (confirmed)
-        { 22, 22 },  // Pattern       (confirmed)
-        { 23, 23 },  // Scene         (confirmed)
-        { 24, 24 },  // Shift         (assumed sequential)
-        { 25, 25 },  // Erase         (confirmed)
-        { 26, 26 },  // Grid          (confirmed)
-        { 30, 27 },  // TransportLeft (confirmed; logical[30] → slot 27)
-        { 28, 28 },  // Record        (confirmed)
-        { 29, 29 },  // Play          (confirmed)
-    };
-    static const int k_scene_row_n = (int)(sizeof(k_scene_row)/sizeof(k_scene_row[0]));
-
-    uint8_t packet_a[33] = {0};
-    packet_a[0] = 0x0c;
-    packet_a[1] = 0x00;  // offset = 0
-
-    if (full_len >= 53) {
-        for (int K = 0; K < 16; K++) {
-            packet_a[2 + k_pad_to_slot[K]] = led_logical[37 + K];
-        }
-    }
-
-    // Scene-row buttons (Packet A slots 16..29).
-    for (int k = 0; k < k_scene_row_n; k++) {
-        uint8_t li = k_scene_row[k].log_idx;
-        uint8_t slot = k_scene_row[k].a_slot;
-        if ((size_t)li < full_len) {
-            packet_a[2 + slot] = led_logical[li];
-        }
-    }
-
-    // TransportRight is still unresolved. Allow a runtime candidate Packet A slot
-    // to be tested without another source edit.
-    {
-        int tright_slot = env_int_or_default("MK1_TRANSPORT_RIGHT_A_SLOT", -1);
-        if (tright_slot >= 0 && tright_slot <= 30 &&
-            full_len > 27 && led_logical[27] != 0) {
-            packet_a[2 + tright_slot] = led_logical[27];
-            LLOG("scene-row override: TransportRight logical[27]=0x%02x -> A slot %d",
-                 led_logical[27], tright_slot);
-        }
-    }
-
-    {
-        char hex[33 * 3 + 1];
-        for (size_t i = 0; i < 33; i++) snprintf(hex + i*3, 4, "%02x ", packet_a[i]);
-        hex[33 * 3] = '\0';
-        LLOG("EP1 A offset=0x00 (33): %s", hex);
-    }
-
-    if (!mk1_device_write_endpoint(br->usb, 0x01, packet_a, 33)) {
-        LLOG("EP1 A write FAILED");
-    }
+static void refresh_led_from_cache(bridge_t *br)
+{
+    if (!br || !br->usb) return;
+    if (g_last_led_logical_len < 32) return;
+    LLOG("refreshing LEDs from cached logical state (len=%zu)", g_last_led_logical_len);
+    emit_led_state(br, g_last_led_logical, g_last_led_logical_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,6 +1273,20 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
         ENCLOG("idx=%u delta=%.4f", encoder_index, delta);
     } else {
         BTNLOG("button event len=%zu type=0x%08x", ev->len, msg_type);
+    }
+
+    if (msg_type == NI_EVT_BTN_DATA && ev->len >= 24) {
+        uint32_t control_index = 0;
+        uint32_t pressed = 0;
+        memcpy(&control_index, ev->raw + 16, 4);
+        memcpy(&pressed,       ev->raw + 20, 4);
+        if (control_index == 0x1c) {
+            bool new_pressed = (pressed != 0);
+            if (g_led_autowrite_pressed != new_pressed) {
+                g_led_autowrite_pressed = new_pressed;
+                refresh_led_from_cache(br);
+            }
+        }
     }
 
     mk1_server_send_event(br->srv, ev->raw, ev->len);

@@ -18,6 +18,8 @@
 #define LOGGER_PATH_ENV "MK1_CALL_LOGGER_PATH"
 #define LOGGER_DEFAULT_PATH "/tmp/mk1-call-logger.log"
 #define LOGGER_PREVIEW_BYTES 96
+#define MK1_SELECTOR_SET_LEDS 6u
+#define MK1_LED_LOGICAL_BYTES 32u
 
 typedef kern_return_t (*io_service_open_fn)(io_service_t, task_port_t, uint32_t, io_connect_t *);
 typedef kern_return_t (*io_service_close_fn)(io_connect_t);
@@ -61,6 +63,8 @@ typedef IOReturn (*iohid_device_get_report_fn)(IOHIDDeviceRef, IOHIDReportType, 
 
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_log_fp = NULL;
+static uint8_t g_last_led_payload[MK1_LED_LOGICAL_BYTES];
+static bool g_last_led_payload_valid = false;
 
 static io_service_open_fn real_IOServiceOpen = NULL;
 static io_service_close_fn real_IOServiceClose = NULL;
@@ -172,6 +176,62 @@ static void logger_hex_preview(const char *label, const void *data, size_t len)
         fprintf(fp, "\n    ... %zu more bytes", len - preview);
     }
     fputc('\n', fp);
+    fflush(fp);
+    pthread_mutex_unlock(&g_log_lock);
+}
+
+static void logger_hex_line_locked(const uint8_t *bytes, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        fprintf(logger_fp(), "%02x%s", bytes[i], (i + 1u < len) ? " " : "");
+    }
+}
+
+static void logger_led_delta_locked(const uint8_t *payload, size_t len)
+{
+    if (!g_last_led_payload_valid) {
+        fprintf(logger_fp(), "    logical delta: <initial snapshot>\n");
+        return;
+    }
+
+    bool any = false;
+    fprintf(logger_fp(), "    logical delta:");
+    for (size_t i = 0; i < len; i++) {
+        if (g_last_led_payload[i] == payload[i]) continue;
+        fprintf(logger_fp(), " logical[%zu]:%02x->%02x",
+                i,
+                g_last_led_payload[i],
+                payload[i]);
+        any = true;
+    }
+    if (!any) {
+        fprintf(logger_fp(), " <no change>");
+    }
+    fputc('\n', logger_fp());
+}
+
+static void logger_led_payload(const char *call_name,
+                               uint32_t selector,
+                               const void *input_struct,
+                               size_t input_struct_cnt)
+{
+    if (selector != MK1_SELECTOR_SET_LEDS || !input_struct) return;
+    if (input_struct_cnt < MK1_LED_LOGICAL_BYTES) return;
+
+    const uint8_t *payload = (const uint8_t *)input_struct;
+    FILE *fp = logger_fp();
+    if (!fp) return;
+
+    pthread_mutex_lock(&g_log_lock);
+    fprintf(fp, "[mk1-call-logger] [%s] [LED sel=%u len=%u] ",
+            call_name,
+            selector,
+            MK1_LED_LOGICAL_BYTES);
+    logger_hex_line_locked(payload, MK1_LED_LOGICAL_BYTES);
+    fputc('\n', fp);
+    logger_led_delta_locked(payload, MK1_LED_LOGICAL_BYTES);
+    memcpy(g_last_led_payload, payload, MK1_LED_LOGICAL_BYTES);
+    g_last_led_payload_valid = true;
     fflush(fp);
     pthread_mutex_unlock(&g_log_lock);
 }
@@ -396,6 +456,7 @@ kern_return_t IOConnectCallMethod(mach_port_t connection,
     }
     if (inputStruct && inputStructCnt) {
         logger_hex_preview("inputStruct", inputStruct, inputStructCnt);
+        logger_led_payload("IOConnectCallMethod", selector, inputStruct, inputStructCnt);
     }
 
     kr = real_IOConnectCallMethod(connection,
@@ -464,6 +525,7 @@ kern_return_t IOConnectCallStructMethod(mach_port_t connection,
                   inputStructCnt);
     if (inputStruct && inputStructCnt) {
         logger_hex_preview("inputStruct", inputStruct, inputStructCnt);
+        logger_led_payload("IOConnectCallStructMethod", selector, inputStruct, inputStructCnt);
     }
 
     kr = real_IOConnectCallStructMethod(connection, selector, inputStruct, inputStructCnt, outputStruct, outputStructCnt);
@@ -508,6 +570,7 @@ kern_return_t IOConnectCallAsyncMethod(mach_port_t connection,
     }
     if (inputStruct && inputStructCnt) {
         logger_hex_preview("inputStruct", inputStruct, inputStructCnt);
+        logger_led_payload("IOConnectCallAsyncMethod", selector, inputStruct, inputStructCnt);
     }
 
     kr = real_IOConnectCallAsyncMethod(connection,
@@ -587,6 +650,7 @@ kern_return_t IOConnectCallAsyncStructMethod(mach_port_t connection,
     }
     if (inputStruct && inputStructCnt) {
         logger_hex_preview("inputStruct", inputStruct, inputStructCnt);
+        logger_led_payload("IOConnectCallAsyncStructMethod", selector, inputStruct, inputStructCnt);
     }
 
     kr = real_IOConnectCallAsyncStructMethod(connection, selector, wake_port, reference, referenceCnt, inputStruct, inputStructCnt, outputStruct, outputStructCnt);
@@ -662,6 +726,7 @@ kern_return_t io_connect_method_scalarI_structureI(mach_port_t connection,
     }
     if (inputStruct && inputStructCnt) {
         logger_hex_preview("inputStruct", inputStruct, inputStructCnt);
+        logger_led_payload("io_connect_method_scalarI_structureI", (uint32_t)selector, inputStruct, inputStructCnt);
     }
 
     kr = real_io_connect_method_scalarI_structureI(connection, selector, input, inputCnt, inputStruct, inputStructCnt);
@@ -683,6 +748,7 @@ kern_return_t io_connect_method_structureI_structureO(mach_port_t connection,
                   connection, selector, inputCnt);
     if (input && inputCnt) {
         logger_hex_preview("inputStruct", input, inputCnt);
+        logger_led_payload("io_connect_method_structureI_structureO", (uint32_t)selector, input, inputCnt);
     }
 
     kr = real_io_connect_method_structureI_structureO(connection, selector, input, inputCnt, output, outputCnt);
@@ -776,6 +842,7 @@ kern_return_t io_async_method_scalarI_structureI(mach_port_t connection,
     }
     if (inputStruct && inputStructCnt) {
         logger_hex_preview("inputStruct", inputStruct, inputStructCnt);
+        logger_led_payload("io_async_method_scalarI_structureI", (uint32_t)selector, inputStruct, inputStructCnt);
     }
 
     kr = real_io_async_method_scalarI_structureI(connection, wake_port, reference, referenceCnt, selector, input, inputCnt, inputStruct, inputStructCnt);
@@ -803,6 +870,7 @@ kern_return_t io_async_method_structureI_structureO(mach_port_t connection,
     }
     if (input && inputCnt) {
         logger_hex_preview("inputStruct", input, inputCnt);
+        logger_led_payload("io_async_method_structureI_structureO", (uint32_t)selector, input, inputCnt);
     }
 
     kr = real_io_async_method_structureI_structureO(connection, wake_port, reference, referenceCnt, selector, input, inputCnt, output, outputCnt);

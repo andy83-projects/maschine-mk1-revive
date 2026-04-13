@@ -57,6 +57,16 @@ Set `MK1_CALL_LOGGER_PATH` to control the output file. Default:
 /tmp/mk1-call-logger.log
 ```
 
+For selector-6 LED traffic, the logger now also emits concise summaries in
+addition to the raw IOKit call dumps:
+
+```text
+[mk1-call-logger] [IOConnectCallStructMethod] [LED sel=6 len=32] <32 hex bytes>
+    logical delta: logical[17]:00->32 ...
+```
+
+That makes Intel runs directly comparable to the Apple Silicon bridge log style.
+
 ## Usage
 
 Run `NIHardwareAgent` with the logger injected:
@@ -84,6 +94,14 @@ Then launch Maschine and exercise:
 3. handshake
 4. LED/display output
 5. pad/button/encoder activity
+
+For Apple-vs-Intel LED comparison, keep the run narrow:
+
+1. wait for startup to settle
+2. `Mute` twice
+3. `Solo` twice
+4. `Record` twice
+5. avoid other controls in the same run
 
 ## Notes
 

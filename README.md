@@ -119,3 +119,31 @@ The `mk1-shim` target builds independently.
 - [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine takes ~30s to reconnect; restart Maschine manually for instant recovery
 - [ ] launchd agent plist
 - [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)
+
+## LED Mapping Workflow
+
+For Apple Silicon project-state LED mapping, prefer running the bridge with:
+
+```bash
+MK1_PROJECT_CAPTURE=1 ./mk1-bridge
+```
+
+This opens an interactive capture mode on `/dev/tty` and logs `PROJCAP` entries to
+`build/Debug/bridge-logs/led.log`. Each capture records:
+
+- logical-slot diffs from the raw `NI_CMD_LED` payload
+- remapped `phys[...]` byte diffs from the outgoing EP1 LED packet
+
+Recommended workflow:
+
+1. Load a project first and wait for the initial LED baseline.
+2. Use low-fanout controls that should only affect a small, local LED cluster.
+3. Prefer Pad Section buttons such as `Scene`, `Pattern`, `Pad Mode`, `Navigate`,
+   `Duplicate`, `Select`, `Solo`, and `Mute`.
+4. Avoid transport buttons and mode switches known to trigger broad LED refreshes,
+   especially `Play` and `Restart`.
+5. For direct physical probing, `MK1_LED_PROBE=1` now supports `phys[0..32]`.
+
+The goal is to capture small diffs that isolate a single button LED or a very small
+set of neighboring LEDs. Large transport-state changes make the results harder to
+trust.

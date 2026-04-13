@@ -117,6 +117,30 @@ static const char *message_name(uint32_t msg_type)
     }
 }
 
+static bool server_verbose_io_enabled(void)
+{
+    const char *value = getenv("MK1_VERBOSE_IO");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static bool server_should_log_request_summary(uint32_t msg_type)
+{
+    if (server_verbose_io_enabled()) return true;
+    switch (msg_type) {
+    case NI_MSG_ACK_NOTIF_PORT:
+    case NI_MSG_DEVSTATE:
+    case NI_MSG_GETSERIAL:
+    case NI_CMD_START:
+    case NI_CMD_LED:
+    case NI_CMD_DISPLAY:
+    case NI_MSG_INSTANCE_NAME:
+    case NI_MSG_UNKNOWN_IST:
+        return false;
+    default:
+        return true;
+    }
+}
+
 static void log_state_transition(const char *label, const char *detail)
 {
     fprintf(stderr, "[server] state: %s", label ? label : "unknown");
@@ -128,6 +152,8 @@ static void log_state_transition(const char *label, const char *detail)
 
 static void log_hex(const char *label, const uint8_t *bytes, size_t len)
 {
+    if (!server_verbose_io_enabled()) return;
+
     fprintf(stderr, "[server]   %s (%zu bytes):", label, len);
     for (size_t i = 0; i < len && i < 128; i++) {
         if (i % 16 == 0) fprintf(stderr, "\n[server]    ");
@@ -266,15 +292,19 @@ static CFDataRef bootstrap_callback(CFMessagePortRef local, SInt32 msgid,
     memcpy(&msg_type, bytes, 4);
     srv->bootstrap_seq++;
 
-    fprintf(stderr, "[server] bootstrap#%u ← %s type=0x%08x len=%ld msgid=%d\n",
-            srv->bootstrap_seq, message_name(msg_type), msg_type, (long)len, (int)msgid);
+    if (server_verbose_io_enabled()) {
+        fprintf(stderr, "[server] bootstrap#%u ← %s type=0x%08x len=%ld msgid=%d\n",
+                srv->bootstrap_seq, message_name(msg_type), msg_type, (long)len, (int)msgid);
+    }
     log_hex("recv", bytes, (size_t)len);
 
     switch (msg_type) {
 
     // --- GetServiceVersion ---
     case NI_MSG_VERSION: {
-        log_state_transition("reply", "GetServiceVersion");
+        if (server_verbose_io_enabled()) {
+            log_state_transition("reply", "GetServiceVersion");
+        }
         msg_buf_t m;
         buf_init(&m);
         buf_push_u32(&m, 0x00020802);  // version (matches real NIHA)
@@ -288,14 +318,18 @@ static CFDataRef bootstrap_callback(CFMessagePortRef local, SInt32 msgid,
 
         uint32_t device_id;
         memcpy(&device_id, bytes + 4, 4);
-        fprintf(stderr, "[server] PID Connect: device_id=0x%04x\n", device_id);
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] PID Connect: device_id=0x%04x\n", device_id);
+        }
 
         // Only handle MK1 — ignore other devices
         if (device_id != MK1_DEVICE_ID) {
-            fprintf(stderr,
-                    "[server] bootstrap#%u not MK1 (0x%04x != 0x%04x), returning empty\n",
-                    srv->bootstrap_seq,
-                    device_id, MK1_DEVICE_ID);
+            if (server_verbose_io_enabled()) {
+                fprintf(stderr,
+                        "[server] bootstrap#%u not MK1 (0x%04x != 0x%04x), returning empty\n",
+                        srv->bootstrap_seq,
+                        device_id, MK1_DEVICE_ID);
+            }
             return NULL;
         }
 
@@ -345,8 +379,10 @@ static CFDataRef bootstrap_callback(CFMessagePortRef local, SInt32 msgid,
         CFRunLoopAddSource(CFRunLoopGetMain(), srv->dev_request_rls,
                            kCFRunLoopCommonModes);
 
-        fprintf(stderr, "[server] dev request port: '%s'\n", srv->dev_req_name);
-        fprintf(stderr, "[server] dev notif name:   '%s'\n", srv->dev_notif_name);
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] dev request port: '%s'\n", srv->dev_req_name);
+            fprintf(stderr, "[server] dev notif name:   '%s'\n", srv->dev_notif_name);
+        }
         log_state_transition("device-session-created", srv->dev_req_name);
 
         // Build reply: [true, req_len, req_name, notif_len, notif_name]
@@ -361,13 +397,17 @@ static CFDataRef bootstrap_callback(CFMessagePortRef local, SInt32 msgid,
         buf_push_u32(&m, (uint32_t)notif_name_len);
         buf_push_bytes(&m, srv->dev_notif_name, notif_name_len);
         CFDataRef reply = finish_reply("reply", &m);
-        fprintf(stderr, "[server] → PID Connect reply (%ld bytes)\n",
-                (long)CFDataGetLength(reply));
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] → PID Connect reply (%ld bytes)\n",
+                    (long)CFDataGetLength(reply));
+        }
         return reply;
     }
 
     case NI_MSG_SERIAL_CONNECT: {
-        log_state_transition("recv", "Serial Connect");
+        if (server_verbose_io_enabled()) {
+            log_state_transition("recv", "Serial Connect");
+        }
         log_hex("serial-connect", bytes, (size_t)len);
 
         if (srv->inst_request_rls) {
@@ -413,8 +453,10 @@ static CFDataRef bootstrap_callback(CFMessagePortRef local, SInt32 msgid,
         CFRunLoopAddSource(CFRunLoopGetMain(), srv->inst_request_rls,
                            kCFRunLoopCommonModes);
 
-        fprintf(stderr, "[server] inst request port: '%s'\n", srv->inst_req_name);
-        fprintf(stderr, "[server] inst notif name:   '%s'\n", srv->inst_notif_name);
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] inst request port: '%s'\n", srv->inst_req_name);
+            fprintf(stderr, "[server] inst notif name:   '%s'\n", srv->inst_notif_name);
+        }
         log_state_transition("instance-session-created", srv->inst_req_name);
 
         size_t req_name_len = strlen(srv->inst_req_name) + 1;
@@ -468,11 +510,13 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
 
     srv->request_seq++;
 
-    fprintf(stderr, "[server] request#%u[%s] ← %s type=0x%08x len=%ld msgid=%d\n",
-            srv->request_seq,
-            channel,
-            message_name(msg_type),
-            msg_type, (long)len, (int)msgid);
+    if (server_should_log_request_summary(msg_type)) {
+        fprintf(stderr, "[server] request#%u[%s] ← %s type=0x%08x len=%ld msgid=%d\n",
+                srv->request_seq,
+                channel,
+                message_name(msg_type),
+                msg_type, (long)len, (int)msgid);
+    }
     log_hex("recv", bytes, (size_t)len);
 
     switch (msg_type) {
@@ -502,8 +546,10 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
 
         bool is_instance = (srv->inst_request_port != NULL &&
                             local == srv->inst_request_port);
-        fprintf(stderr, "[server] ACK (%s): client notif port = '%s'\n",
-                is_instance ? "instance" : "device", client_notif);
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] ACK (%s): client notif port = '%s'\n",
+                    is_instance ? "instance" : "device", client_notif);
+        }
 
         // Connect to client's notification port (REMOTE)
         CFStringRef notif_cf = CFStringCreateWithCString(NULL, client_notif,
@@ -523,17 +569,23 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
             srv->inst_connected = true;
             strlcpy(srv->maschine_inst_notif_name, client_notif,
                     sizeof(srv->maschine_inst_notif_name));
-            fprintf(stderr, "[server] === instance handshake complete ===\n");
+            if (server_verbose_io_enabled()) {
+                fprintf(stderr, "[server] === instance handshake complete ===\n");
+            }
             push_numeric_event(srv, NI_EVT_DEVSTATE_BOOL, NI_TAG_TRUE);
             // SETFOCUS is sent later, after instance name command (step 10)
         } else {
             if (srv->dev_notif_remote) CFRelease(srv->dev_notif_remote);
             srv->dev_notif_remote = remote;
             srv->dev_connected = true;
-            fprintf(stderr, "[server] === device handshake complete ===\n");
+            if (server_verbose_io_enabled()) {
+                fprintf(stderr, "[server] === device handshake complete ===\n");
+            }
         }
-        fprintf(stderr, "[server] event push target (%s): '%s'\n",
-                is_instance ? "instance" : "device", client_notif);
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] event push target (%s): '%s'\n",
+                    is_instance ? "instance" : "device", client_notif);
+        }
         log_connection_summary(srv);
 
         if (srv->connect_cb) {
@@ -549,7 +601,9 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
 
     // --- Start command ---
     case NI_CMD_START: {
-        log_state_transition("recv", "Start command");
+        if (server_verbose_io_enabled()) {
+            log_state_transition("recv", "Start command");
+        }
         if (srv->cmd_cb) {
             srv->cmd_cb(msg_type, bytes, (size_t)len, srv->cb_context);
         }
@@ -561,7 +615,9 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
     }
 
     case NI_MSG_DEVSTATE: {
-        log_state_transition("recv", "Device state query");
+        if (server_verbose_io_enabled()) {
+            log_state_transition("recv", "Device state query");
+        }
         msg_buf_t m;
         buf_init(&m);
         buf_push_u32(&m, NI_MSG_DEVSTATE);
@@ -574,7 +630,9 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
     case NI_MSG_GETSERIAL: {
         // Sniffer-confirmed reply: [serialLen, paddedSerial\0] (21 bytes)
         // No type prefix, no "true" flag
-        log_state_transition("recv", "GetSerial query");
+        if (server_verbose_io_enabled()) {
+            log_state_transition("recv", "GetSerial query");
+        }
         char padded[NI_SERIAL_PADDED_LEN];
         pad_serial(padded, srv->serial[0] ? srv->serial : "MK1-BRIDGE");
         msg_buf_t m;
@@ -597,7 +655,9 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
                 inst_name[name_len] = '\0';
             }
         }
-        fprintf(stderr, "[server] instance name: '%s'\n", inst_name);
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] instance name: '%s'\n", inst_name);
+        }
 
         if (srv->cmd_cb) {
             srv->cmd_cb(msg_type, bytes, (size_t)len, srv->cb_context);
@@ -618,8 +678,10 @@ static CFDataRef request_callback(CFMessagePortRef local, SInt32 msgid,
 
     // --- All other commands (LED, display, etc.) ---
     default: {
-        fprintf(stderr, "[server] ← %s command 0x%08x (%ld bytes)\n",
-                message_name(msg_type), msg_type, (long)len);
+        if (server_verbose_io_enabled()) {
+            fprintf(stderr, "[server] ← %s command 0x%08x (%ld bytes)\n",
+                    message_name(msg_type), msg_type, (long)len);
+        }
 
         // Forward full raw message to bridge callback
         if (srv->cmd_cb) {
@@ -704,11 +766,13 @@ static bool push_to_port(mk1_server_t *srv, CFMessagePortRef *target_slot,
                 (int)result);
         return false;
     }
-    fprintf(stderr,
-            "[server] push_event ok (%s msgid=0x%08x %ld bytes)\n",
-            target_label,
-            msgid,
-            (long)CFDataGetLength(payload));
+    if (server_verbose_io_enabled()) {
+        fprintf(stderr,
+                "[server] push_event ok (%s msgid=0x%08x %ld bytes)\n",
+                target_label,
+                msgid,
+                (long)CFDataGetLength(payload));
+    }
     return true;
 }
 
@@ -735,8 +799,10 @@ static bool push_numeric_event(mk1_server_t *srv, uint32_t msg_type, uint32_t va
     buf_push_u32(&m, value);
 
     CFDataRef payload = buf_to_cfdata(&m);
-    fprintf(stderr, "[server] → numeric event %s 0x%08x value=0x%08x\n",
-            message_name(msg_type), msg_type, value);
+    if (server_verbose_io_enabled()) {
+        fprintf(stderr, "[server] → numeric event %s 0x%08x value=0x%08x\n",
+                message_name(msg_type), msg_type, value);
+    }
     log_hex("send", CFDataGetBytePtr(payload), (size_t)CFDataGetLength(payload));
 
     bool ok = push_event(srv, payload);
@@ -867,8 +933,10 @@ bool mk1_server_send_device_on(mk1_server_t *srv, const char *serial)
     buf_push_bytes(&m, padded, NI_SERIAL_PADDED_LEN);
 
     CFDataRef payload = buf_to_cfdata(&m);
-    fprintf(stderr, "[server] -> DEVICE_ON serial='%s' (%ld bytes)\n",
-            srv->serial, (long)CFDataGetLength(payload));
+    if (server_verbose_io_enabled()) {
+        fprintf(stderr, "[server] -> DEVICE_ON serial='%s' (%ld bytes)\n",
+                srv->serial, (long)CFDataGetLength(payload));
+    }
     log_hex("send", CFDataGetBytePtr(payload), (size_t)CFDataGetLength(payload));
 
     bool ok = push_event(srv, payload);

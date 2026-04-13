@@ -10,14 +10,18 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 
 #include "mk1_server.h"
 #include "../mk1-usb/mk1_device.h"
 #include "../mk1-ipc/mk1_ipc.h"
+
+extern char **environ;
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -41,6 +45,8 @@ static FILE *g_log_encoder = NULL;
 // terminal remains usable for interactive prompts. Category logs still go to
 // their log files as usual.
 static bool g_quiet = false;
+static pid_t g_spawned_maschine_pid = -1;
+static bool g_aux_mode_started = false;
 
 #define LOG(fp, fmt, ...) do { \
     if (!g_quiet) fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
@@ -109,6 +115,7 @@ static volatile int g_running = 1;
 static uint16_t g_led_pad_pressure[16]   = {0};  // live pad state used for synthetic rubber LEDs
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRunLoopGetMain()); }
+static void maybe_start_guided_mode(bridge_t *br);
 
 // ---------------------------------------------------------------------------
 // Session state — for bridge reconnect while Maschine is running
@@ -560,12 +567,116 @@ static void project_capture_on_led(const uint8_t *logical, size_t logical_len,
                                    const uint8_t *phys, size_t phys_len);
 static bool env_truthy(const char *name);
 
+typedef enum {
+    MK1_LED_EVIDENCE_PROVISIONAL = 0,
+    MK1_LED_EVIDENCE_STABLE      = 1,
+    MK1_LED_EVIDENCE_CONFIRMED   = 2,
+} mk1_led_evidence_t;
+
+typedef struct {
+    uint8_t phys_idx;
+    const char *label;
+    mk1_led_evidence_t evidence;
+} mk1_apple_phys_label_t;
+
+typedef struct {
+    uint8_t logical_idx;
+    uint8_t phys_idx;
+    const char *label;
+    mk1_led_evidence_t evidence;
+} mk1_apple_redirect_evidence_t;
+
+static const mk1_apple_phys_label_t k_apple_phys_labels[] = {
+    {  1, "Transport Left", MK1_LED_EVIDENCE_PROVISIONAL },
+    {  2, "Restart",        MK1_LED_EVIDENCE_PROVISIONAL },
+    {  3, "H",              MK1_LED_EVIDENCE_PROVISIONAL },
+    {  4, "G",              MK1_LED_EVIDENCE_PROVISIONAL },
+    {  5, "D",              MK1_LED_EVIDENCE_PROVISIONAL },
+    {  6, "C",              MK1_LED_EVIDENCE_PROVISIONAL },
+    {  7, "F",              MK1_LED_EVIDENCE_PROVISIONAL },
+    {  8, "E",              MK1_LED_EVIDENCE_PROVISIONAL },
+    {  9, "B",              MK1_LED_EVIDENCE_PROVISIONAL },
+    { 10, "A",              MK1_LED_EVIDENCE_PROVISIONAL },
+    { 11, "Auto-Write",     MK1_LED_EVIDENCE_PROVISIONAL },
+    { 12, "Snap",           MK1_LED_EVIDENCE_PROVISIONAL },
+    { 13, "Modules Right",  MK1_LED_EVIDENCE_PROVISIONAL },
+    { 14, "Modules Left",   MK1_LED_EVIDENCE_PROVISIONAL },
+    { 15, "Sampling",       MK1_LED_EVIDENCE_PROVISIONAL },
+    { 16, "Browse",         MK1_LED_EVIDENCE_PROVISIONAL },
+    { 17, "Step",           MK1_LED_EVIDENCE_STABLE },
+    { 18, "Control",        MK1_LED_EVIDENCE_STABLE },
+    { 19, "SA8",            MK1_LED_EVIDENCE_STABLE },
+    { 20, "SA7",            MK1_LED_EVIDENCE_STABLE },
+    { 21, "SA6",            MK1_LED_EVIDENCE_STABLE },
+    { 22, "SA5",            MK1_LED_EVIDENCE_STABLE },
+    { 23, "SA4",            MK1_LED_EVIDENCE_STABLE },
+    { 24, "SA3",            MK1_LED_EVIDENCE_STABLE },
+    { 25, "SA2",            MK1_LED_EVIDENCE_STABLE },
+    { 26, "SA1",            MK1_LED_EVIDENCE_STABLE },
+    { 27, "Note Repeat",    MK1_LED_EVIDENCE_STABLE },
+};
+
+static const mk1_apple_redirect_evidence_t k_apple_redirect_evidence[] = {
+    // Record is still retained as a runtime redirect; Mute/Solo direct-slot claims
+    // have been rolled back after verify runs failed across lower and upper ranges.
+};
+
+static const char *apple_evidence_name(mk1_led_evidence_t evidence)
+{
+    switch (evidence) {
+        case MK1_LED_EVIDENCE_PROVISIONAL: return "provisional";
+        case MK1_LED_EVIDENCE_STABLE:      return "stable";
+        case MK1_LED_EVIDENCE_CONFIRMED:   return "confirmed";
+    }
+    return "unknown";
+}
+
+static const mk1_apple_phys_label_t *apple_phys_label_entry(uint8_t phys_idx)
+{
+    for (size_t i = 0; i < sizeof(k_apple_phys_labels) / sizeof(k_apple_phys_labels[0]); i++) {
+        if (k_apple_phys_labels[i].phys_idx == phys_idx) return &k_apple_phys_labels[i];
+    }
+    return NULL;
+}
+
+static const mk1_apple_redirect_evidence_t *apple_redirect_evidence_entry(uint8_t logical_idx)
+{
+    for (size_t i = 0; i < sizeof(k_apple_redirect_evidence) / sizeof(k_apple_redirect_evidence[0]); i++) {
+        if (k_apple_redirect_evidence[i].logical_idx == logical_idx) {
+            return &k_apple_redirect_evidence[i];
+        }
+    }
+    return NULL;
+}
+
+static bool apple_upper_has_non_passthrough_override(const void *entries_void, int count, uint8_t logical_idx)
+{
+    const struct {
+        uint8_t log_idx;
+        uint8_t override;
+        const char *name;
+    } *entries = entries_void;
+
+    for (int i = 0; i < count; i++) {
+        if (entries[i].log_idx != logical_idx) continue;
+        if (entries[i].override != 0xFF) return true;
+    }
+    return false;
+}
+
 static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 {
-    // Restore the full 32-slot selector-6 remap for button/group/transport LEDs.
-    // This matches the prior checked-in bridge behavior and the shim's authoritative
-    // logical-to-physical ordering. Pad LED experiments stay out of the default path.
-    // Intel-era table: logical[17..31]→phys[17..31] identity, logical[16]→phys[13].
+    // Base linear remap for selector-6 LEDs.
+    //
+    // This is a legacy logical->phys ordering used as the starting point before any
+    // Apple Silicon overrides are applied. The recent guided probe work gives a much
+    // better picture of what the physical slots are, but it does NOT by itself prove
+    // which NI logical byte drives each slot. Keep that distinction explicit:
+    //
+    //   direct probe    => "phys[N] visibly lights <label>"
+    //   bridge remap    => "logical[N] currently forwards to phys[M]"
+    //
+    // Pad LED experiments stay out of the default path.
     static const uint8_t k_hw_by_logical[32] = {
          0,
          4,  3,  2,  1,
@@ -586,63 +697,55 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
     //   0xFE = suppress     — clear linear phys write, do not forward
     //   0..31 = redirect    — clear linear phys, write to this phys instead
     //
-    // Confirmed physical range (Apple Silicon, latest project capture 2026-04-11f):
-    //   phys[17]=Mute,    phys[18]=Select,   phys[20]=Navigate, phys[21]=Pad Mode,
-    //   phys[23]=Solo,
-    //   phys[24]=Play,    phys[25]=Erase,    phys[26]=Shift,
-    //   phys[28]=LCD-BL,  phys[29]=Record,   phys[30]=Scene,
-    //   phys[19]/[22]/[27]/[31] = still unresolved in current evidence
-    // Focused capture after the phys[0] fix resolved Mute/Solo as 17/23 respectively.
+    // The old comment block here leaned too heavily on project-capture inference.
+    // Current evidence should be read like this instead:
     //
-    // NOTE: overrides for [24]→25, [28]→29, [30]→26 clobber the linear writes
-    // for logical[25], [29], [26] respectively. If those slots also carry button
-    // LEDs they may need their own entries below — add 0xFF passthrough to observe.
+    //   1. `PROJCAP phys` is bridge output, not hardware truth.
+    //   2. Guided direct probe gives reliable physical slot labels.
+    //   3. Only a small subset of logical->phys redirects are actually confirmed.
+    //
+    // Evidence is tracked separately from runtime remap behavior:
+    //   k_apple_phys_labels          = current physical-slot labels from guided probe
+    //   k_apple_redirect_evidence    = logical->phys redirects strong enough to encode
+    //
+    // Current interpretation:
+    //   phys[ 1..16] = provisional project-context labels
+    //   phys[17..27] = stable direct-probe labels
+    //   direct-slot redirects for Mute/Solo/Record are NOT currently trusted
+    //   the currently known-bad fallback slots stay suppressed on Apple Silicon
+    //   until isolated press-to-visible-slot evidence exists
+    //
+    // For phys[28..32], guided probe currently shows no useful visible effect beyond
+    // phys[28] acting like a backlight/control-adjacent slot.
+    //
+    // NOTE: the table below is intentionally conservative. Suppression here means
+    // "known bad or untrusted on Apple Silicon", not "known absent in hardware".
     static const struct {
         uint8_t log_idx;
         uint8_t override;   // 0xFF=passthrough, 0xFE=suppress, 0..31=redirect
         const char *name;
     } k_apple_upper[] = {
-        // --- Confirmed redirects ---
-        { 17,   23, "Solo"      },  // CONFIRMED logical[17] -> phys[23]
-        { 16,   17, "Mute"      },  // CONFIRMED logical[16] -> phys[17]
-        { 28,   29, "Record"    },  // CONFIRMED phys[29]=Record
+        // --- Suppressed until mapped ---
+        { 28, 0xFE, "Record?" },
 
-        // --- Identified from log 2026-04-10: ---
-        // logical[30] = LEFT nav carrier (NOT Shift — prior "Shift confirmed" was pressing Left!)
-        // logical[27] = RIGHT nav carrier
-        // logical[25] = fires with Left press; likely Erase carrier or secondary Left state
-        // Older linear assumption for the Apple Silicon Pad Section is stale.
-        // Latest PROJCAP evidence points to:
-        //   logical[16] -> phys[17] = Mute
-        //   logical[17] -> phys[23] = Solo
-        //   logical[18] -> phys[18] = Select
-        //   logical[20] -> phys[20] = Navigate
-        //   logical[21] -> phys[21] = Pad Mode
+        // --- Known-bad fallback slots suppressed until mapped ---
+        { 16, 0xFE, "Mute?" }, { 17, 0xFE, "Solo?" },
+
+        // --- Correlation candidates retained for logging only ---
+        // These entries are passthrough-only. They do not encode truth; they only keep
+        // logging alive for slots that have shown interesting activity in captures.
         //
-        // NOTE 2026-04-11: Intel-era lower-range phys mapping is WRONG on Apple Silicon.
-        // phys[4]=pad1 rubber, phys[5]=pad8 rubber, phys[16]=pad13 rubber, phys[31]=dead.
-        // Upper range fully mapped — nav arrows NOT in phys[17..31].
-        // Current project-loaded evidence only supports:
-        //   Mute(17), Select(18), Navigate(20), PadMode(21), Solo(23), Scene(30),
-        //   Play(24), Erase(25), Shift(26), LCDBl(28), Record(29).
-        // Duplicate / Pattern / Grid and several adjacent slots still need
-        // isolated confirmation before they should be encoded as fixed mappings.
-        //
-        // CONFIRMED 2026-04-11: logical[24]=LEFT nav carrier, logical[27]=RIGHT nav carrier.
-        // (No lower-range slots fire on Left/Right press — confirmed via log sweep.)
-        // logical[30] fires alongside Left but is a Scene state update, not the nav carrier.
-        // phys[32]=Play LED confirmed (writing to byte 33 of packet lights Play).
-        // phys[0..32] fully explored — nav arrows NOT found in no-project state.
-        // Hypothesis: nav arrows are dark without a project loaded; retest with project.
+        // Recent guided probe disproved the older claim that low phys slots were pad
+        // rubber locations on Apple Silicon. Treat any remaining logical-name claims
+        // here as provisional until isolated capture + hardware observation agree.
         { 24, 0xFF, "log24" }, { 25, 0xFF, "log25" }, { 26, 0xFF, "log26" },
         { 27, 0xFF, "log27" }, { 29, 0xFF, "log29" }, { 30, 0xFF, "log30" },
-        // Lower-range slots — fire in with-project state for Left/Right nav:
-        {  1, 0xFF, "log1"  }, {  2, 0xFF, "log2"  }, {  3, 0xFF, "log3"  },
-        {  4, 0xFF, "log4"  }, {  5, 0xFF, "log5"  }, {  6, 0xFF, "log6"  },
-        {  7, 0xFF, "log7"  }, {  8, 0xFF, "log8"  }, {  9, 0xFF, "log9"  },
+        // Lower-range slots observed active in project-context runs:
+        {  1, 0xFE, "log1"  }, {  2, 0xFE, "log2"  }, {  3, 0xFE, "log3"  },
+        {  4, 0xFF, "log4"  }, {  5, 0xFF, "log5"  }, {  6, 0xFE, "log6"  },
+        {  7, 0xFE, "log7"  }, {  8, 0xFF, "log8"  }, {  9, 0xFF, "log9"  },
         { 10, 0xFF, "log10" }, { 11, 0xFF, "log11" }, { 12, 0xFF, "log12" },
         { 13, 0xFF, "log13" }, { 14, 0xFF, "log14" }, { 15, 0xFF, "log15" },
-        { 16, 0xFF, "log16" },
     };
     static const int k_apple_upper_n =
         (int)(sizeof(k_apple_upper) / sizeof(k_apple_upper[0]));
@@ -723,12 +826,29 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         s_have_prev = true;
     }
 
-    uint8_t remapped[34] = {0};  // [0..32]; phys[32] used for nav arrow test
-    remapped[0]  = 0x1e; // control register — constant in all real NIHA full-state packets
+    // EP1 DIMM_LEDS uses an offset protocol: byte[1] is the start position in the
+    // device's LED array, and the remaining bytes are consecutive LED values from
+    // that offset.  Two packets cover the full array:
+    //
+    //   Packet A  offset=0x00 (33 bytes): device positions  0..30
+    //     pos 0..15  = pad rubber LEDs  (cabl ordering: row-reversed per row of 4)
+    //     pos 16..29 = scene-row buttons (Mute/Solo/Select/Dup/Nav/PadMode/Pattern/
+    //                  Scene/Shift/Erase/Grid/TransportLeft/Record/Play)
+    //                  ← logical[] mapping TBD; zeroed until learn pass confirms
+    //     pos 30     = unused
+    //
+    //   Packet B  offset=0x1E (34 bytes): device positions 30..62
+    //     pos 30     = unused (first data byte is position 30; nothing visible)
+    //     pos 31..46 = Group buttons, transport, browse, sampling, modules
+    //     pos 47..57 = Step, Control, SA8..SA1, Note Repeat
+    //     pos 57     = LCD backlight (driven by IPC logical[28] or kept at 0x5c)
 
-    // Apply the full selector-6 remap for logical[0..31].
-    // logical[0] is not a button LED carrier on EP1; phys[0] is the DIMM_LEDS
-    // control register and must remain fixed at 0x1e.
+    uint8_t remapped[34] = {0};  // data for Packet B; remapped[0] becomes offset byte 0x1E
+    remapped[0] = 0x1e;          // offset byte — tells firmware: start writing at device pos 30
+
+    // Route IPC logical[0..31] into Packet B (offset=0x1E, device positions 30..61).
+    // k_hw_by_logical[N] gives the index into remapped[] for logical slot N.
+    // remapped[0] is the offset byte — skip it (phy_idx==0 guard).
     for (size_t log_idx = 0; log_idx < 32 && log_idx < full_len; log_idx++) {
         uint8_t phy_idx = k_hw_by_logical[log_idx];
         if (phy_idx == 0) continue;
@@ -748,9 +868,18 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         uint8_t old_phys = k_hw_by_logical[li];  // li < 32 guaranteed by table
 
         if (ov == 0xFF) {
+            if (apple_upper_has_non_passthrough_override(k_apple_upper, k_apple_upper_n, li)) {
+                continue;
+            }
             // passthrough — linear mapping already applied; log for correlation
-            LLOG("upper-slot active: %s logical[%u]=0x%02x -> phys[%u] (linear)",
-                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys);
+            const mk1_apple_phys_label_t *phys = apple_phys_label_entry(old_phys);
+            LLOG("upper-slot active: %s logical[%u]=0x%02x -> phys[%u]%s%s%s%s%s (linear)",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys,
+                 phys ? " " : "",
+                 phys ? phys->label : "",
+                 phys ? " [" : "",
+                 phys ? apple_evidence_name(phys->evidence) : "",
+                 phys ? "]" : "");
         } else if (ov == 0xFE) {
             // suppress — clear the linearly-written byte, do not forward
             if (old_phys < 34) remapped[old_phys] = 0;
@@ -758,44 +887,83 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
                  k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys);
         } else {
             // redirect — clear linear byte, write value to override phys
+            const mk1_apple_redirect_evidence_t *claim = apple_redirect_evidence_entry(li);
+            const mk1_apple_phys_label_t *phys = apple_phys_label_entry(ov);
             if (old_phys < 34) remapped[old_phys] = 0;
             if (ov < 34)       remapped[ov] = led_logical[li];
-            LLOG("upper-slot redirect: %s logical[%u]=0x%02x -> phys[%u] (was phys[%u])",
-                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)ov, (unsigned)old_phys);
+            LLOG("upper-slot redirect: %s logical[%u]=0x%02x -> phys[%u]%s%s%s%s%s (was phys[%u], %s%s%s)",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)ov,
+                 phys ? " " : "",
+                 phys ? phys->label : "",
+                 phys ? " [" : "",
+                 phys ? apple_evidence_name(phys->evidence) : "",
+                 phys ? "]" : "",
+                 (unsigned)old_phys,
+                 claim ? claim->label : "runtime-only",
+                 claim ? ", " : "",
+                 claim ? apple_evidence_name(claim->evidence) : "");
         }
     }
 
-    // Rubber pad LEDs: mechanism not yet identified.
-    // We intentionally do not synthesize or remap pad LEDs here in the default path.
-    // phys[17..27] = Step/Control/SA1-SA8/NoteRepeat buttons (confirmed by probe sweep + user).
-    // phys[28] = LCD backlight. phys[29..31] = no visible effect.
-    // logical[37..52] contains pad brightness data from NIHA but correct phys positions unknown.
-
     if (env_truthy("MK1_PROJECT_CAPTURE")) {
-        // During in-project mapping passes, suppress the unresolved lower range so
-        // stale Intel-era remaps do not light misleading Group/transport LEDs.
-        for (size_t phys = 1; phys <= 16; phys++) remapped[phys] = 0;
-        // phys[32] is currently a visible contaminant during capture; keep project
-        // mapping mode non-visual and rely on logical/phys diff logs instead.
+        for (size_t i = 1; i <= 16; i++) remapped[i] = 0;
         remapped[32] = 0;
     }
 
     project_capture_on_led(led_logical, full_len, remapped, 33);
 
-    uint8_t packet[34] = {0};
-    packet[0] = 0x0c;
-    memcpy(packet + 1, remapped, 33);  // 33 bytes: phys[0..32]; phys[32] used for nav arrow test
-    size_t packet_len = 34;
+    // --- Packet B: offset=0x1E (groups, transport, display buttons) ---
+    uint8_t packet_b[34] = {0};
+    packet_b[0] = 0x0c;
+    memcpy(packet_b + 1, remapped, 33);
 
     {
         char hex[34 * 3 + 1];
-        for (size_t i = 0; i < packet_len; i++) snprintf(hex + i*3, 4, "%02x ", packet[i]);
-        hex[packet_len * 3] = '\0';
-        LLOG("EP1 (%zu): %s", packet_len, hex);
+        for (size_t i = 0; i < 34; i++) snprintf(hex + i*3, 4, "%02x ", packet_b[i]);
+        hex[34 * 3] = '\0';
+        LLOG("EP1 B offset=0x1e (34): %s", hex);
     }
 
-    if (!mk1_device_write_endpoint(br->usb, 0x01, packet, packet_len)) {
-        LLOG("EP1 write FAILED");
+    if (!mk1_device_write_endpoint(br->usb, 0x01, packet_b, 34)) {
+        LLOG("EP1 B write FAILED");
+    }
+
+    // --- Packet A: offset=0x00 (pad rubber LEDs + scene-row buttons) ---
+    //
+    // Pad rubber LED mapping (confirmed from offset=0x00 probe 2026-04-12):
+    //   IPC logical[37+K] (pad K+1, K=0..15) → slot (3 - K%4) + (K/4)*4
+    //   i.e. within each row of 4 pads the order is reversed: pad4,pad3,pad2,pad1
+    //
+    // Scene-row button slots (16..29): logical[] mapping TBD from learn pass.
+    //   Confirmed hardware positions: Mute(16) Solo(17) Select(18) Duplicate(19)
+    //   Navigate(20) PadMode(21) Pattern(22) Scene(23) Shift(24) Erase(25)
+    //   Grid(26) TransportLeft(27) Record(28) Play(29)
+    static const uint8_t k_pad_to_slot[16] = {
+         3,  2,  1,  0,   // pads  1- 4 (logical[37..40])
+         7,  6,  5,  4,   // pads  5- 8 (logical[41..44])
+        11, 10,  9,  8,   // pads  9-12 (logical[45..48])
+        15, 14, 13, 12,   // pads 13-16 (logical[49..52])
+    };
+
+    uint8_t packet_a[33] = {0};
+    packet_a[0] = 0x0c;
+    packet_a[1] = 0x00;  // offset = 0
+
+    if (full_len >= 53) {
+        for (int K = 0; K < 16; K++) {
+            packet_a[2 + k_pad_to_slot[K]] = led_logical[37 + K];
+        }
+    }
+
+    {
+        char hex[33 * 3 + 1];
+        for (size_t i = 0; i < 33; i++) snprintf(hex + i*3, 4, "%02x ", packet_a[i]);
+        hex[33 * 3] = '\0';
+        LLOG("EP1 A offset=0x00 (33): %s", hex);
+    }
+
+    if (!mk1_device_write_endpoint(br->usb, 0x01, packet_a, 33)) {
+        LLOG("EP1 A write FAILED");
     }
 }
 
@@ -871,6 +1039,8 @@ static void on_connect(void *ctx)
     if (!mk1_server_send_device_on(br->srv, serial)) {
         BLOG("WARNING: DEVICE_ON send failed");
     }
+
+    maybe_start_guided_mode(br);
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,6 +1184,117 @@ static int env_int_or_default(const char *name, int fallback)
     long parsed = strtol(value, &end, 10);
     if (!end || *end != '\0') return fallback;
     return (int)parsed;
+}
+
+static const char *maschine_exec_path(void)
+{
+    const char *path = getenv("MK1_MASCHINE_EXEC");
+    if (path && path[0]) return path;
+    return "/Applications/Native Instruments/Maschine 2/Maschine 2.app/Contents/MacOS/Maschine 2";
+}
+
+static void init_led_packet(uint8_t packet[34])
+{
+    memset(packet, 0, 34);
+    packet[0] = 0x0c;
+    packet[1] = 0x1e;   // offset byte — start writing at device LED position 30
+    packet[29] = 0x5c;  // device pos 57 (30+27) = LCD backlight; keep lit during probe
+}
+
+static bool parse_next_slot(const char **cursor, int *out_slot)
+{
+    const char *p = *cursor;
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    if (*p == '\0') {
+        *cursor = p;
+        return false;
+    }
+
+    char *end = NULL;
+    long parsed = strtol(p, &end, 10);
+    if (end == p) return false;
+    *cursor = end;
+    *out_slot = (int)parsed;
+    return true;
+}
+
+static int parse_slot_list(const char *text, int *slots, int max_slots)
+{
+    if (!text || !text[0] || max_slots <= 0) return 0;
+    int count = 0;
+    const char *cursor = text;
+    int slot = -1;
+    while (count < max_slots && parse_next_slot(&cursor, &slot)) {
+        if (slot >= 0 && slot <= 32) slots[count++] = slot;
+    }
+    return count;
+}
+
+static bool maschine_process_running(void)
+{
+    FILE *pg = popen("pgrep -x 'Maschine 2' 2>/dev/null", "r");
+    if (!pg) return false;
+    char pid_line[32] = {0};
+    bool running = (fgets(pid_line, sizeof(pid_line), pg) != NULL && pid_line[0] != '\0');
+    pclose(pg);
+    return running;
+}
+
+static void maybe_launch_maschine(void)
+{
+    if (!env_truthy("MK1_AUTO_OPEN_MASCHINE")) return;
+    if (maschine_process_running()) {
+        BLOG("Maschine already running — auto-open skipped");
+        return;
+    }
+
+    const char *path = maschine_exec_path();
+    if (access(path, X_OK) != 0) {
+        BLOG("Maschine auto-open failed: executable not found or not executable: %s", path);
+        return;
+    }
+
+    char *const argv[] = { (char *)path, NULL };
+    pid_t pid = -1;
+    int err = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+    if (err != 0) {
+        BLOG("Maschine auto-open failed: posix_spawn err=%d", err);
+        return;
+    }
+
+    g_spawned_maschine_pid = pid;
+    BLOG("Maschine auto-open launched pid=%d", (int)pid);
+}
+
+static void maybe_close_maschine(void)
+{
+    if (!env_truthy("MK1_AUTO_CLOSE_MASCHINE")) return;
+    if (g_spawned_maschine_pid <= 0) {
+        BLOG("Maschine auto-close skipped: no bridge-launched pid");
+        return;
+    }
+
+    if (kill(g_spawned_maschine_pid, SIGTERM) != 0) {
+        BLOG("Maschine auto-close SIGTERM failed for pid=%d", (int)g_spawned_maschine_pid);
+        g_spawned_maschine_pid = -1;
+        return;
+    }
+
+    BLOG("Maschine auto-close sent SIGTERM to pid=%d", (int)g_spawned_maschine_pid);
+    for (int i = 0; i < 20; i++) {
+        int status = 0;
+        pid_t result = waitpid(g_spawned_maschine_pid, &status, WNOHANG);
+        if (result == g_spawned_maschine_pid) {
+            g_spawned_maschine_pid = -1;
+            return;
+        }
+        usleep(100 * 1000);
+    }
+
+    if (kill(g_spawned_maschine_pid, SIGKILL) == 0) {
+        BLOG("Maschine auto-close escalated to SIGKILL for pid=%d", (int)g_spawned_maschine_pid);
+    }
+    g_spawned_maschine_pid = -1;
 }
 
 #define LED_CAPTURE_LOGICAL_MAX 57
@@ -1516,37 +1797,57 @@ static void *learn_thread_fn(void *arg)
 static void run_led_probe(mk1_device_t *dev)
 {
     const int from = env_int_or_default("MK1_LED_PROBE_FROM", 0);
-    const int to = env_int_or_default("MK1_LED_PROBE_TO", 32);
+    const int to = env_int_or_default("MK1_LED_PROBE_TO", 30);
     const useconds_t dwell_us = (useconds_t)(env_int_or_default("MK1_LED_PROBE_MS", 700) * 1000);
     const uint8_t level = (uint8_t)env_int_or_default("MK1_LED_PROBE_LEVEL", 0x32);
     const bool interactive = env_truthy("MK1_LED_PROBE_INTERACTIVE");
 
-    BLOG("LED probe mode: slots %d..%d level=0x%02x dwell=%u ms",
-         from, to, level, (unsigned)(dwell_us / 1000));
+    // MK1_LED_PROBE_OFFSET controls the second byte of the EP1 DIMM_LEDS packet.
+    // Default -1 means "use existing format": {0x0C, 0x1E, data[0..32]}.
+    // Set to 0 to probe the cabl-style offset=0 region: {0x0C, 0x00, data[0..30]}.
+    // Any value 0..255 is sent literally as byte[1], and slots index into data[].
+    const int probe_offset_raw = env_int_or_default("MK1_LED_PROBE_OFFSET", -1);
+    const bool use_offset_mode = (probe_offset_raw >= 0 && probe_offset_raw <= 255);
+    const uint8_t probe_offset = use_offset_mode ? (uint8_t)probe_offset_raw : 0x1e;
+
+    BLOG("LED probe mode: slots %d..%d level=0x%02x dwell=%u ms offset=%s",
+         from, to, level, (unsigned)(dwell_us / 1000),
+         use_offset_mode ? "explicit" : "0x1e (default)");
 
     for (int idx = from; idx <= to; idx++) {
-        uint8_t packet[34] = {0};
+        uint8_t packet[34];
+        size_t packet_len;
 
-        if (idx < 0 || idx > 32) continue;
-
-        packet[0] = 0x0c;
-        packet[1] = 0x1e; // keep the controller-side LED engine/backlight control slot consistent
-        packet[1 + idx] = level;
+        if (use_offset_mode) {
+            // cabl-style: {0x0C, offset, leds[0..30]} — 33 bytes, one slot lit
+            if (idx < 0 || idx > 30) continue;
+            memset(packet, 0, sizeof(packet));
+            packet[0] = 0x0c;
+            packet[1] = probe_offset;
+            packet[2 + idx] = level;
+            packet_len = 33;
+        } else {
+            // Existing format: {0x0C, 0x1E, phys[0..32]} — 34 bytes
+            if (idx < 0 || idx > 32) continue;
+            init_led_packet(packet);
+            packet[1 + idx] = level;
+            packet_len = 34;
+        }
 
         {
             char hex[34 * 3 + 1];
-            for (size_t i = 0; i < sizeof(packet); i++) snprintf(hex + i * 3, 4, "%02x ", packet[i]);
-            hex[sizeof(packet) * 3] = '\0';
-            LLOG("LED probe slot %d: %s", idx, hex);
+            for (size_t i = 0; i < packet_len; i++) snprintf(hex + i * 3, 4, "%02x ", packet[i]);
+            hex[packet_len * 3] = '\0';
+            LLOG("LED probe slot %d (offset=0x%02x): %s", idx, (unsigned)probe_offset, hex);
         }
 
-        mk1_device_write_endpoint(dev, 0x01, packet, sizeof(packet));
+        mk1_device_write_endpoint(dev, 0x01, packet, packet_len);
         if (interactive) {
             char note[256];
             fprintf(stderr,
-                    "\n[probe] slot %d active. Type what lit up, then press Enter\n"
-                    "[probe] example: Group A bright | none | LCD backlight on\n> ",
-                    idx);
+                    "\n[probe] slot %d (offset=0x%02x) active. Type what lit up, then press Enter\n"
+                    "[probe] example: Scene | Mute | none\n> ",
+                    idx, (unsigned)probe_offset);
             fflush(stderr);
             if (fgets(note, sizeof(note), stdin)) {
                 size_t len = strlen(note);
@@ -1563,10 +1864,196 @@ static void run_led_probe(mk1_device_t *dev)
         }
     }
 
+    // Clear — use whatever format we were probing with
     {
-        uint8_t packet[34] = {0x0c, 0x1e};
+        uint8_t off_packet[34];
+        if (use_offset_mode) {
+            memset(off_packet, 0, 33);
+            off_packet[0] = 0x0c;
+            off_packet[1] = probe_offset;
+            mk1_device_write_endpoint(dev, 0x01, off_packet, 33);
+        } else {
+            init_led_packet(off_packet);
+            mk1_device_write_endpoint(dev, 0x01, off_packet, 34);
+        }
+    }
+}
+
+static void run_led_verify(mk1_device_t *dev)
+{
+    const char *slots_env = getenv("MK1_LED_VERIFY_SLOTS");
+    const char *label = getenv("MK1_LED_VERIFY_LABEL");
+    const uint8_t level = (uint8_t)env_int_or_default("MK1_LED_VERIFY_LEVEL", 0x32);
+    const int repeats = env_int_or_default("MK1_LED_VERIFY_REPEATS", 3);
+    const int dwell_ms = env_int_or_default("MK1_LED_VERIFY_DWELL_MS", 900);
+    const int gap_ms = env_int_or_default("MK1_LED_VERIFY_GAP_MS", 500);
+    const int startup_delay_ms = env_int_or_default("MK1_LED_VERIFY_STARTUP_DELAY_MS", 5000);
+    const bool randomize = env_truthy("MK1_LED_VERIFY_RANDOMIZE");
+    FILE *tty = fopen("/dev/tty", "r+");
+    if (!tty) tty = stderr;
+
+    if (!slots_env || !slots_env[0]) {
+        BLOG("LED verify requested without MK1_LED_VERIFY_SLOTS");
+        if (tty != stderr) fclose(tty);
+        return;
+    }
+
+    int slots[64];
+    int nslots = parse_slot_list(slots_env, slots, (int)(sizeof(slots) / sizeof(slots[0])));
+    if (nslots <= 0) {
+        BLOG("LED verify requested with no valid slots: %s", slots_env);
+        if (tty != stderr) fclose(tty);
+        return;
+    }
+
+    fprintf(tty,
+            "\n=== MK1 LED VERIFY ===\n"
+            "This mode tests explicit candidate phys slots with isolated EP1 packets.\n"
+            "Known constants are preserved on every write: phys[0]=0x1e, phys[28]=0x5c.\n"
+            "Target: %s\n"
+            "Slots: %s\n"
+            "Level: 0x%02x\n"
+            "Startup delay: %d ms\n\n",
+            (label && label[0]) ? label : "(unlabeled)",
+            slots_env, level);
+    fflush(tty);
+
+    if (startup_delay_ms > 0) {
+        fprintf(tty,
+                "[verify] waiting %d ms for Maschine/UI to settle before trials...\n",
+                startup_delay_ms);
+        fflush(tty);
+        usleep((useconds_t)(startup_delay_ms * 1000));
+    }
+
+    int trials[64 * 16];
+    int trial_count = 0;
+    int max_trials = (int)(sizeof(trials) / sizeof(trials[0]));
+    for (int r = 0; r < repeats; r++) {
+        for (int i = 0; i < nslots && trial_count < max_trials; i++) {
+            trials[trial_count++] = slots[i];
+        }
+    }
+    if (randomize) {
+        for (int i = trial_count - 1; i > 0; i--) {
+            int j = (int)arc4random_uniform((uint32_t)(i + 1));
+            int tmp = trials[i];
+            trials[i] = trials[j];
+            trials[j] = tmp;
+        }
+    }
+
+    int score_correct[33] = {0};
+    int score_wrong[33] = {0};
+    int score_none[33] = {0};
+    int score_ambig[33] = {0};
+
+    for (int ordinal = 0; ordinal < trial_count; ordinal++) {
+        int slot = trials[ordinal];
+        uint8_t packet[34];
+        init_led_packet(packet);
+        packet[1 + slot] = level;
+
+        {
+            char hex[34 * 3 + 1];
+            for (size_t i = 0; i < sizeof(packet); i++) snprintf(hex + i * 3, 4, "%02x ", packet[i]);
+            hex[sizeof(packet) * 3] = '\0';
+            LLOG("LED verify %s slot %d packet: %s",
+                 (label && label[0]) ? label : "(unlabeled)", slot, hex);
+        }
+
+        mk1_device_write_endpoint(dev, 0x01, packet, sizeof(packet));
+
+        fprintf(tty,
+                "[verify %d/%d] %s candidate phys[%d] active.\n"
+                "Score: 1=correct 2=wrong-led 3=nothing 4=ambiguous\n> ",
+                ordinal + 1, trial_count,
+                (label && label[0]) ? label : "LED",
+                slot);
+        fflush(tty);
+
+        char note[256];
+        if (!fgets(note, sizeof(note), tty)) {
+            LLOG("LED verify %s slot %d observed: <stdin closed>",
+                 (label && label[0]) ? label : "(unlabeled)", slot);
+            clearerr(tty);
+            break;
+        }
+        char score = note[0];
+        switch (score) {
+            case '1': score_correct[slot]++; break;
+            case '2': score_wrong[slot]++; break;
+            case '3': score_none[slot]++; break;
+            default:  score_ambig[slot]++; score = '4'; break;
+        }
+        LLOG("LED verify %s slot %d score=%c",
+             (label && label[0]) ? label : "(unlabeled)", slot, score);
+
+        usleep((useconds_t)(dwell_ms * 1000));
+        uint8_t off_packet[34];
+        init_led_packet(off_packet);
+        mk1_device_write_endpoint(dev, 0x01, off_packet, sizeof(off_packet));
+        usleep((useconds_t)(gap_ms * 1000));
+    }
+
+    {
+        uint8_t packet[34];
+        init_led_packet(packet);
         mk1_device_write_endpoint(dev, 0x01, packet, sizeof(packet));
     }
+
+    fprintf(tty, "\nSummary for %s:\n", (label && label[0]) ? label : "(unlabeled)");
+    for (int i = 0; i < nslots; i++) {
+        int slot = slots[i];
+        fprintf(tty,
+                "  phys[%d]: correct=%d wrong=%d none=%d ambiguous=%d\n",
+                slot, score_correct[slot], score_wrong[slot], score_none[slot], score_ambig[slot]);
+        LLOG("LED verify summary %s phys[%d]: correct=%d wrong=%d none=%d ambiguous=%d",
+             (label && label[0]) ? label : "(unlabeled)",
+             slot,
+             score_correct[slot], score_wrong[slot], score_none[slot], score_ambig[slot]);
+    }
+
+    fprintf(tty, "\n=== LED VERIFY COMPLETE ===\n");
+    if (tty != stderr) fclose(tty);
+}
+
+static void *guided_mode_thread_fn(void *arg)
+{
+    bridge_t *br = (bridge_t *)arg;
+    if (!br || !br->usb) return NULL;
+
+    if (env_truthy("MK1_LED_VERIFY")) {
+        BLOG("guided LED verify starting after Maschine connection");
+        run_led_verify(br->usb);
+    } else if (env_truthy("MK1_LED_PROBE")) {
+        const int delay_ms = env_int_or_default("MK1_LED_PROBE_STARTUP_DELAY_MS", 5000);
+        if (delay_ms > 0) {
+            BLOG("guided LED probe waiting %d ms after Maschine connection", delay_ms);
+            usleep((useconds_t)(delay_ms * 1000));
+        }
+        if (!g_running || !br->usb) return NULL;
+        BLOG("guided LED probe starting");
+        run_led_probe(br->usb);
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_running = 0;
+        CFRunLoopStop(CFRunLoopGetMain());
+    });
+    return NULL;
+}
+
+static void maybe_start_guided_mode(bridge_t *br)
+{
+    if (g_aux_mode_started) return;
+    if (!env_truthy("MK1_LED_PROBE") && !env_truthy("MK1_LED_VERIFY")) return;
+    if (!br || !br->usb || !br->srv || !mk1_server_is_connected(br->srv)) return;
+
+    g_aux_mode_started = true;
+    pthread_t tid;
+    pthread_create(&tid, NULL, guided_mode_thread_fn, br);
+    pthread_detach(tid);
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +2100,7 @@ static bool device_open_and_init(bridge_t *br)
         if (!mk1_server_send_device_on(br->srv, serial)) {
             BLOG("WARNING: DEVICE_ON send failed after arrival");
         }
+        maybe_start_guided_mode(br);
     } else {
         // Maschine not yet connected — show prompt on both displays.
         show_status_screen(br);
@@ -1686,28 +2174,9 @@ int main(int argc, char **argv)
 
     BLOG("mk1-bridge starting");
 
-    if (env_truthy("MK1_LED_PROBE")) {
-        BLOG("standalone LED probe requested");
-        g_bridge.usb = mk1_device_open();
-        if (!g_bridge.usb) {
-            BLOG("LED probe failed: could not open MK1");
-            close_logs();
-            return 1;
-        }
-        if (!mk1_device_init_hardware(g_bridge.usb)) {
-            BLOG("LED probe warning: hardware init failed");
-        }
-        if (!mk1_device_start(g_bridge.usb, on_pad, on_button, &g_bridge)) {
-            BLOG("LED probe warning: could not start USB read thread");
-        }
-        usleep(250 * 1000);
-        run_led_probe(g_bridge.usb);
-        mk1_device_stop(g_bridge.usb);
-        mk1_device_close(g_bridge.usb);
-        g_bridge.usb = NULL;
-        BLOG("LED probe complete");
-        close_logs();
-        return 0;
+    if (env_truthy("MK1_LED_PROBE") || env_truthy("MK1_LED_VERIFY")) {
+        g_quiet = true;
+        BLOG("guided LED test mode active — waiting for Maschine connection");
     }
 
     g_bridge.srv = mk1_server_start(on_connect, on_cmd, &g_bridge);
@@ -1747,6 +2216,8 @@ int main(int argc, char **argv)
         BLOG("WARNING: hot-plug watcher failed to start");
     }
 
+    maybe_launch_maschine();
+
     BLOG("waiting for MK1 and Maschine software...");
     CFRunLoopRun();
 
@@ -1762,6 +2233,8 @@ int main(int argc, char **argv)
         mk1_device_stop(g_bridge.usb);
         mk1_device_close(g_bridge.usb);
     }
+
+    maybe_close_maschine();
 
     BLOG("shutdown complete");
     close_logs();

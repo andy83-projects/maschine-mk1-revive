@@ -742,8 +742,10 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         { 29, 0xFE, "Play (scene-row)"           },  // confirmed
         { 30, 0xFE, "TransportLeft (scene-row)"  },  // confirmed
 
-        // --- Passthrough: Note Repeat stays in B-pkt (data[27] = device pos 57) ---
-        { 27, 0xFF, "log27" },
+        // --- TransportRight: suppress B-pkt; A-pkt slot TBD (probe slot 30 next) ---
+        // logical[27] = TransportRight confirmed from learn 2026-04-13.
+        // Was routing to B-pkt data[27] = Note Repeat hardware position (wrong).
+        { 27, 0xFE, "TRight (suppress until slot confirmed)" },
 
         // Lower-range slots observed active in project-context runs:
         {  1, 0xFE, "log1"  }, {  2, 0xFE, "log2"  }, {  3, 0xFE, "log3"  },
@@ -1684,7 +1686,7 @@ static const learn_btn_t k_learn_seq[] = {
     { "SA2",           25 },
     { "SA1",           26 },
     { "Note Repeat",   27 },
-    // offset=0x00 scene-row buttons (phys=-1 = unknown logical slot)
+    // offset=0x00 region (PADS row + transport area buttons)
     { "Mute",          -1 },
     { "Solo",          -1 },
     { "Select",        -1 },
@@ -1697,6 +1699,7 @@ static const learn_btn_t k_learn_seq[] = {
     { "Erase",         -1 },
     { "Grid",          -1 },
     { "TransportLeft", -1 },
+    { "TransportRight",-1 },
     { "Record",        -1 },
     { "Play",          -1 },
 };

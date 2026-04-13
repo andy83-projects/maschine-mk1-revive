@@ -59,11 +59,16 @@ for the LED IPC→EP1 payload translation.
 
 ### LED output (EP1 / selector 6)
 - Command: `0x0c` (DIMM_LEDS) on **EP1**, never EP8
-- Wire format: `{ 0x0c, phys[0], phys[1], ..., phys[32] }` — **34 bytes total** (extended for pad rubber LEDs)
-  (usb.pcapng shows 33-byte packets from old Maschine; extended to 34 for current Maschine's pad rubber data)
-- `sendCommand` in the kext rejects payloads `>= 0x40` (64 bytes); 34 bytes is well within limit
+- Wire format: **offset-based**, two packets per full update:
+  - `{ 0x0c, offset, led[0], led[1], ... }` — byte[1] is the start position in the device's LED array
+  - **Packet A** (33 bytes): `{ 0x0c, 0x00, led[0..30] }` — device positions 0..30
+  - **Packet B** (34 bytes): `{ 0x0c, 0x1e, led[0..32] }` — device positions 30..62
+- `sendCommand` in the kext rejects payloads `>= 0x40` (64 bytes); both packets are well within limit
 - LED stability requires a live EP1 command-reply loop (`commandReplyDispatch` in kext
   continuously re-arms EP1-in reads; without this, repeated writes may stall)
+- **Note**: our bridge previously sent only Packet B with byte[1]=0x1e misidentified as a "control
+  register". It is an offset. Packet A was missing, which is why pad rubber LEDs and scene-row
+  buttons (Mute/Solo/Scene/Pattern/etc.) were never lit.
 
 #### IPC → EP1 LED pipeline (confirmed from bridge logs 2026-04-06)
 IPC `NI_CMD_LED` (0x036c7500) message layout:
@@ -75,8 +80,9 @@ bytes[40..43]= logical[32..35] — unused (other NI device slots)
 bytes[44..59]= logical[36..51] — pad rubber LED brightness for pads 1–16
                logical[N+36] = pad N brightness (N=1..16, i.e. logical[37]=pad1, logical[52]=pad16)
 ```
-Apply `hw_by_logical` remap for button LEDs, inject logical[37..52] → phys[17..32] for rubber LEDs,
-then send 34-byte EP1 packet.
+Send **two EP1 packets** per LED update:
+- **Packet B** (34 bytes, offset=0x1E): Apply `hw_by_logical` remap for logical[0..31] → groups/transport/display buttons
+- **Packet A** (33 bytes, offset=0x00): Map logical[37+K] → slot `(3-K%4)+(K/4)*4` for pad rubber LEDs; scene-row button mapping TBD from learn pass
 
 **Note**: The IPC payload offset changed between Maschine versions. Old Maschine (Intel/pcap era)
 placed pad rubber data at logical[17..31] (within 32 bytes, so old 33-byte EP1 packets worked).
@@ -85,28 +91,42 @@ velocity-flash correlation: pressing pad 3 flashes both logical[3] (Group G butt
 logical[39] (pad 3 rubber) to 0x3f simultaneously.
 
 #### Confirmed physical EP1 position → hardware (0-indexed)
-phys[0] = constant `0x1e` in all original NIHA full-state packets (unknown purpose —
-may be a control/enable register; "no effect" was incorrect).
 
-| phys pos | Confirmed | phys pos | Confirmed |
-|----------|-----------|----------|-----------|
-| 0  | 0x1e control reg (purpose TBD) | 17 | pad 1 rubber LED |
-| 1  | dead / no LED visible          | 18 | pad 2 rubber LED |
-| 2  | Group G                        | 19 | pad 3 rubber LED |
-| 3  | Group H                        | 20 | pad 4 rubber LED |
-| 4  | Restart (transport)            | 21 | pad 5 rubber LED |
-| 5  | Left navigation (transport)    | 22 | pad 6 rubber LED |
-| 6  | Group E                        | 23 | pad 7 rubber LED |
-| 7  | Group F                        | 24 | pad 8 rubber LED |
-| 8  | Group C                        | 25 | pad 9 rubber LED |
-| 9  | Group D                        | 26 | pad 10 rubber LED |
-| 10 | Skip                           | 27 | pad 11 rubber LED |
-| 11 | Auto Write                     | 28 | pad 12 rubber LED |
-| 12 | Group A                        | 29 | pad 13 rubber LED |
-| 13 | Group B                        | 30 | pad 14 rubber LED |
-| 14 | Browse                         | 31 | pad 15 rubber LED |
-| 15 | Sampling                       | 32 | pad 16 rubber LED |
-| 16 | Modules Left                   |    |                   |
+**Packet A (offset=0x00) — device positions 0..30** (confirmed 2026-04-12 via offset=0x00 probe):
+
+| pos | Hardware        | pos | Hardware        | pos | Hardware        |
+|-----|-----------------|-----|-----------------|-----|-----------------|
+|  0  | pad 4 rubber    |  8  | pad 12 rubber   | 16  | Mute            |
+|  1  | pad 3 rubber    |  9  | pad 11 rubber   | 17  | Solo            |
+|  2  | pad 2 rubber    | 10  | pad 10 rubber   | 18  | Select          |
+|  3  | pad 1 rubber    | 11  | pad 9 rubber    | 19  | Duplicate       |
+|  4  | pad 8 rubber    | 12  | pad 16 rubber   | 20  | Navigate        |
+|  5  | pad 7 rubber    | 13  | pad 15 rubber   | 21  | Pad Mode        |
+|  6  | pad 6 rubber    | 14  | pad 14 rubber   | 22  | Pattern         |
+|  7  | pad 5 rubber    | 15  | pad 13 rubber   | 23  | Scene           |
+|     |                 |     |                 | 24  | Shift           |
+|     |                 |     |                 | 25  | Erase           |
+|     |                 |     |                 | 26  | Grid            |
+|     |                 |     |                 | 27  | Transport Left  |
+|     |                 |     |                 | 28  | Record          |
+|     |                 |     |                 | 29  | Play            |
+|     |                 |     |                 | 30  | (unused)        |
+
+**Packet B (offset=0x1E) — device positions 30..62** (data byte N → device position 30+N):
+
+| data[N] | Hardware             | data[N] | Hardware             |
+|---------|----------------------|---------|----------------------|
+|  0      | (unused/dead)        | 11      | Auto Write           |
+|  1      | dead / no LED        | 12      | Snap                 |
+|  2      | Group G              | 13      | Modules Right        |
+|  3      | Group H              | 14      | Modules Left         |
+|  4      | Restart (transport)  | 15      | Sampling             |
+|  5      | Left navigation      | 16      | Browse               |
+|  6      | Group E              | 17      | Step                 |
+|  7      | Group F              | 18      | Control              |
+|  8      | Group C              | 19..26  | SA8..SA1 (disp btns) |
+|  9      | Group D              | 27      | Note Repeat          |
+| 10      | Skip                 | 27      | LCD backlight (0x5c) |
 
 #### Logical IPC index → physical EP1 position
 Button/group/transport LEDs via `hw_by_logical[32]` in `mk1-bridge/main.c`:

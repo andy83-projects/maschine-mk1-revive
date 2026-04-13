@@ -725,21 +725,26 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
         uint8_t override;   // 0xFF=passthrough, 0xFE=suppress, 0..31=redirect
         const char *name;
     } k_apple_upper[] = {
-        // --- Suppressed until mapped ---
-        { 28, 0xFE, "Record?" },
+        // --- Scene-row buttons: suppress from B-pkt; routed to Packet A via k_scene_row ---
+        // Logical indices confirmed from LED learn pass 2026-04-12.
+        { 16, 0xFE, "Mute (scene-row)"          },  // assumed
+        { 17, 0xFE, "Solo (scene-row)"           },  // confirmed
+        { 18, 0xFE, "Select (scene-row)"         },  // confirmed
+        { 19, 0xFE, "Duplicate (scene-row)"      },  // confirmed
+        { 20, 0xFE, "Navigate (scene-row)"       },  // confirmed
+        { 21, 0xFE, "PadMode (scene-row)"        },  // confirmed
+        { 22, 0xFE, "Pattern (scene-row)"        },  // confirmed
+        { 23, 0xFE, "Scene (scene-row)"          },  // confirmed
+        { 24, 0xFE, "Shift (scene-row)"          },  // assumed sequential
+        { 25, 0xFE, "Erase (scene-row)"          },  // confirmed
+        { 26, 0xFE, "Grid (scene-row)"           },  // confirmed
+        { 28, 0xFE, "Record (scene-row)"         },  // confirmed
+        { 29, 0xFE, "Play (scene-row)"           },  // confirmed
+        { 30, 0xFE, "TransportLeft (scene-row)"  },  // confirmed
 
-        // --- Known-bad fallback slots suppressed until mapped ---
-        { 16, 0xFE, "Mute?" }, { 17, 0xFE, "Solo?" },
+        // --- Passthrough: Note Repeat stays in B-pkt (data[27] = device pos 57) ---
+        { 27, 0xFF, "log27" },
 
-        // --- Correlation candidates retained for logging only ---
-        // These entries are passthrough-only. They do not encode truth; they only keep
-        // logging alive for slots that have shown interesting activity in captures.
-        //
-        // Recent guided probe disproved the older claim that low phys slots were pad
-        // rubber locations on Apple Silicon. Treat any remaining logical-name claims
-        // here as provisional until isolated capture + hardware observation agree.
-        { 24, 0xFF, "log24" }, { 25, 0xFF, "log25" }, { 26, 0xFF, "log26" },
-        { 27, 0xFF, "log27" }, { 29, 0xFF, "log29" }, { 30, 0xFF, "log30" },
         // Lower-range slots observed active in project-context runs:
         {  1, 0xFE, "log1"  }, {  2, 0xFE, "log2"  }, {  3, 0xFE, "log3"  },
         {  4, 0xFF, "log4"  }, {  5, 0xFF, "log5"  }, {  6, 0xFE, "log6"  },
@@ -934,16 +939,35 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
     //   IPC logical[37+K] (pad K+1, K=0..15) → slot (3 - K%4) + (K/4)*4
     //   i.e. within each row of 4 pads the order is reversed: pad4,pad3,pad2,pad1
     //
-    // Scene-row button slots (16..29): logical[] mapping TBD from learn pass.
-    //   Confirmed hardware positions: Mute(16) Solo(17) Select(18) Duplicate(19)
-    //   Navigate(20) PadMode(21) Pattern(22) Scene(23) Shift(24) Erase(25)
-    //   Grid(26) TransportLeft(27) Record(28) Play(29)
+    // Scene-row button mapping (confirmed from LED learn pass 2026-04-12):
+    //   logical[] indices map directly to device positions 16..29 in Packet A.
+    //   TransportLeft is the exception: logical[30] → slot 27 (not sequential).
     static const uint8_t k_pad_to_slot[16] = {
          3,  2,  1,  0,   // pads  1- 4 (logical[37..40])
          7,  6,  5,  4,   // pads  5- 8 (logical[41..44])
         11, 10,  9,  8,   // pads  9-12 (logical[45..48])
         15, 14, 13, 12,   // pads 13-16 (logical[49..52])
     };
+
+    // Scene-row: logical[] index → Packet A slot (device pos 16..29).
+    // Confirmed from LED learn pass 2026-04-12. Mute and Shift are assumed.
+    static const struct { uint8_t log_idx; uint8_t a_slot; } k_scene_row[] = {
+        { 16, 16 },  // Mute          (assumed by position)
+        { 17, 17 },  // Solo          (confirmed)
+        { 18, 18 },  // Select        (confirmed)
+        { 19, 19 },  // Duplicate     (confirmed)
+        { 20, 20 },  // Navigate      (confirmed)
+        { 21, 21 },  // Pad Mode      (confirmed)
+        { 22, 22 },  // Pattern       (confirmed)
+        { 23, 23 },  // Scene         (confirmed)
+        { 24, 24 },  // Shift         (assumed sequential)
+        { 25, 25 },  // Erase         (confirmed)
+        { 26, 26 },  // Grid          (confirmed)
+        { 30, 27 },  // TransportLeft (confirmed; logical[30] → slot 27)
+        { 28, 28 },  // Record        (confirmed)
+        { 29, 29 },  // Play          (confirmed)
+    };
+    static const int k_scene_row_n = (int)(sizeof(k_scene_row)/sizeof(k_scene_row[0]));
 
     uint8_t packet_a[33] = {0};
     packet_a[0] = 0x0c;
@@ -952,6 +976,15 @@ static void forward_led(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
     if (full_len >= 53) {
         for (int K = 0; K < 16; K++) {
             packet_a[2 + k_pad_to_slot[K]] = led_logical[37 + K];
+        }
+    }
+
+    // Scene-row buttons (Packet A slots 16..29).
+    for (int k = 0; k < k_scene_row_n; k++) {
+        uint8_t li = k_scene_row[k].log_idx;
+        uint8_t slot = k_scene_row[k].a_slot;
+        if ((size_t)li < full_len) {
+            packet_a[2 + slot] = led_logical[li];
         }
     }
 
@@ -1640,7 +1673,6 @@ static const learn_btn_t k_learn_seq[] = {
     { "Modules Right", 13 },
     { "Sampling",      15 },
     { "Browse",        16 },
-    { "Left (nav)",     1 },
     { "Restart",        2 },
     { "Control",       18 },
     { "SA8",           19 },

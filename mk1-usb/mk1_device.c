@@ -902,6 +902,20 @@ static int8_t mk1_wrapped_u8_delta(uint8_t previous, uint8_t current)
     return (int8_t)delta;
 }
 
+static bool mk1_encoder_value_increased(uint8_t x,
+                                        uint8_t y,
+                                        uint8_t prev_x,
+                                        uint8_t prev_y)
+{
+    if (x > 127) {
+        return (y > 127) ? (x < prev_x && y >= prev_y)
+                         : (x >= prev_x && y >= prev_y);
+    }
+
+    return (y > 127) ? (x < prev_x && y < prev_y)
+                     : (x >= prev_x && y < prev_y);
+}
+
 static void mk1_emit_knob_event(mk1_device_t *dev,
                                 const char *label,
                                 uint32_t encoder_index,
@@ -1073,10 +1087,14 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
     };
 
     // byte[4] doubles as the secondary byte for Screen4 encoder AND the Auto Write/Sampling
-    // button discriminator. Detect the button state first so the encoder loop can skip
-    // frames where byte[4] is in a button range (0x6x/0x7x) rather than an encoder position.
+    // button discriminator. When Screen4 is turning, byte[4] legitimately walks through
+    // the same 0x6x/0x7x ranges used by those buttons, so button synthesis must be
+    // suppressed whenever the Screen4 byte pair is moving.
     uint8_t b4_high_nibble = data[4] & 0xf0;
     bool b4_is_button = (b4_high_nibble == 0x60 || b4_high_nibble == 0x70);
+    int8_t screen4_delta_a = mk1_wrapped_u8_delta(dev->ep1_len33_prev[3], data[3]);
+    int8_t screen4_delta_b = mk1_wrapped_u8_delta(dev->ep1_len33_prev[4], data[4]);
+    bool screen4_encoder_motion = (screen4_delta_a != 0 || screen4_delta_b != 0);
 
     for (size_t i = 0; i < sizeof(knob_map) / sizeof(knob_map[0]); i++) {
         uint8_t prev_a = dev->ep1_len33_prev[knob_map[i].byte_a];
@@ -1088,24 +1106,41 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
             continue;
         }
 
-        // Skip encoder if its secondary byte is byte[4] and byte[4] is in button range —
-        // the value is a button state code, not an encoder position.
-        if (knob_map[i].byte_b == 4 && b4_is_button) {
+        // Skip encoder if its secondary byte is byte[4] and byte[4] is in button range
+        // *without* accompanying Screen4 motion — in that case the value is button state,
+        // not encoder position.
+        if (knob_map[i].byte_b == 4 && b4_is_button && !screen4_encoder_motion) {
             continue;
         }
 
         int8_t delta_primary = mk1_wrapped_u8_delta(prev_a, curr_a);
         int8_t delta_secondary = mk1_wrapped_u8_delta(prev_b, curr_b);
-        int8_t chosen_delta = delta_primary;
-        if (chosen_delta == 0) {
-            chosen_delta = delta_secondary;
+        bool value_increased = mk1_encoder_value_increased(curr_a, curr_b, prev_a, prev_b);
+        int dominant_abs = delta_primary < 0 ? -delta_primary : delta_primary;
+        int abs_secondary = delta_secondary < 0 ? -delta_secondary : delta_secondary;
+        int chosen_abs = dominant_abs;
+
+        if (abs_secondary > chosen_abs) {
+            chosen_abs = abs_secondary;
         }
+
+        if (chosen_abs == 0) {
+            continue;
+        }
+
+        int8_t chosen_delta = (int8_t)(value_increased ? chosen_abs : -chosen_abs);
 
         if (chosen_delta != 0) {
             float normalized = (float)chosen_delta / 255.0f;
             if (g_encoder_log) {
-                fprintf(g_encoder_log, "[mk1-usb] knob %s raw_delta=%d normalized=%.4f\n",
-                        knob_map[i].name, (int)chosen_delta, (double)normalized);
+                fprintf(g_encoder_log,
+                        "[mk1-usb] knob %s delta_a=%d delta_b=%d dir=%s chosen=%d normalized=%.4f\n",
+                        knob_map[i].name,
+                        (int)delta_primary,
+                        (int)delta_secondary,
+                        value_increased ? "inc" : "dec",
+                        (int)chosen_delta,
+                        (double)normalized);
                 fflush(g_encoder_log);
             }
             mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
@@ -1117,10 +1152,10 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
     memcpy(dev->ep1_len33_prev, data, sizeof(dev->ep1_len33_prev));
     dev->ep1_len33_prev_valid = true;
 
-    // Observed traces: Auto Write pulses show a 0x7x high nibble, Sampling pulses appear as 0x6x,
-    // and the shared release state resides in the 0x5x range.  We emit NI BTN_DATA events
-    // whenever we cross those boundaries.
-    if (b4_high_nibble == 0x70) {
+    // Observed traces: Auto Write pulses show a 0x7x high nibble, Sampling pulses appear as
+    // 0x6x, and the shared release state resides in the 0x5x range. Do not synthesize these
+    // button events while Screen4 is rotating; that path reuses the same byte values.
+    if (!screen4_encoder_motion && b4_high_nibble == 0x70) {
         if (!dev->ep1_33_autowrite_pressed) {
             dev->ep1_33_autowrite_pressed = true;
             dev->ep1_33_sampling_pressed = false;
@@ -1129,7 +1164,7 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         return;
     }
 
-    if (b4_high_nibble == 0x60) {
+    if (!screen4_encoder_motion && b4_high_nibble == 0x60) {
         if (!dev->ep1_33_sampling_pressed) {
             dev->ep1_33_sampling_pressed = true;
             dev->ep1_33_autowrite_pressed = false;
@@ -1138,7 +1173,7 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         return;
     }
 
-    if (b4_high_nibble == 0x50) {
+    if (!screen4_encoder_motion && b4_high_nibble == 0x50) {
         if (dev->ep1_33_autowrite_pressed) {
             dev->ep1_33_autowrite_pressed = false;
             mk1_emit_button_event(dev, "Auto Write", 0x1c, false);

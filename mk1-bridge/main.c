@@ -259,6 +259,7 @@ static void try_maschine_reconnect(void)
 static bool g_maschine_process_running = false;
 static bool g_maschine_exit_watcher_started = false;
 static void show_status_screen(bridge_t *br);  // forward declaration
+static void show_disconnected_led_state(bridge_t *br);  // forward declaration
 
 static void poll_maschine_process(void)
 {
@@ -274,6 +275,7 @@ static void poll_maschine_process(void)
 
     if (g_maschine_process_running && !running && g_bridge.usb) {
         BLOG("Maschine exited — showing status screen");
+        show_disconnected_led_state(&g_bridge);
         show_status_screen(&g_bridge);
     }
     g_maschine_process_running = running;
@@ -1216,6 +1218,33 @@ static void refresh_led_from_cache(bridge_t *br)
     if (g_last_led_logical_len < 32) return;
     LLOG("refreshing LEDs from cached logical state (len=%zu)", g_last_led_logical_len);
     emit_led_state(br, g_last_led_logical, g_last_led_logical_len);
+}
+
+static void show_disconnected_led_state(bridge_t *br)
+{
+    if (!br || !br->usb) return;
+
+    enum { CONTROL_LOGICAL_INDEX = 47 };
+    uint8_t led_logical[128] = {0};
+    size_t logical_len = g_last_led_logical_len;
+    if (logical_len <= CONTROL_LOGICAL_INDEX) logical_len = CONTROL_LOGICAL_INDEX + 1;
+    if (logical_len > sizeof(led_logical)) logical_len = sizeof(led_logical);
+
+    uint8_t control_level = 0x32;
+    if (g_last_led_logical_len > CONTROL_LOGICAL_INDEX &&
+        g_last_led_logical[CONTROL_LOGICAL_INDEX] != 0) {
+        control_level = g_last_led_logical[CONTROL_LOGICAL_INDEX];
+    }
+    led_logical[CONTROL_LOGICAL_INDEX] = control_level;
+
+    memcpy(g_last_led_logical, led_logical, logical_len);
+    if (logical_len < sizeof(g_last_led_logical)) {
+        memset(g_last_led_logical + logical_len, 0, sizeof(g_last_led_logical) - logical_len);
+    }
+    g_last_led_logical_len = logical_len;
+
+    LLOG("showing disconnected LED state: Control only");
+    emit_led_state(br, led_logical, logical_len);
 }
 
 // ---------------------------------------------------------------------------

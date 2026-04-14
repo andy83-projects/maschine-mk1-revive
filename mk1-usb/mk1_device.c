@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdarg.h>
 
 #include "../mk1-ipc/mk1_ipc.h"
 
@@ -85,6 +86,7 @@ struct mk1_device {
     uint16_t                 pad_baseline[MK1_PAD_COUNT];
 
     pthread_mutex_t          reply_lock;
+    pthread_mutex_t          io_lock;
     bool                     have_device_spec_reply;
     bool                     have_user_data_reply;
     bool                     saw_device_info_reply;
@@ -115,8 +117,45 @@ struct mk1_user_client {
 };
 
 static FILE *g_encoder_log = NULL;
+static FILE *g_timing_log = NULL;
 
 void mk1_device_set_encoder_log(FILE *fp) { g_encoder_log = fp; }
+void mk1_device_set_timing_log(FILE *fp) { g_timing_log = fp; }
+
+static bool mk1_timing_trace_enabled(void)
+{
+    const char *value = getenv("MK1_TIMING_TRACE");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static uint64_t mk1_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void mk1_timing_log(const char *fmt, ...)
+{
+    va_list args;
+
+    if (!mk1_timing_trace_enabled()) return;
+
+    va_start(args, fmt);
+    fprintf(stderr, "[timing]  ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+
+    if (g_timing_log) {
+        va_start(args, fmt);
+        fprintf(g_timing_log, "[timing]  ");
+        vfprintf(g_timing_log, fmt, args);
+        fprintf(g_timing_log, "\n");
+        fflush(g_timing_log);
+        va_end(args);
+    }
+}
 
 static int32_t mk1_uc_send_ep1_command(mk1_user_client_t *client,
                                        uint8_t command,
@@ -1869,6 +1908,12 @@ static void *read_thread_main(void *context)
             continue;
         }
 
+        mk1_timing_log("usb-in endpoint=0x%02x pipe=%u len=%u ts_ns=%llu",
+                       reader->endpoint_number,
+                       pipe_ref,
+                       (unsigned)size,
+                       (unsigned long long)mk1_now_ns());
+
         log_all_pipe_report(reader, buffer, size);
         if (reader->endpoint_number == 1) {
             mk1_device_process_ep1_button_packet(dev, reader, buffer, size);
@@ -1891,11 +1936,13 @@ mk1_device_t *mk1_device_open(void)
     dev->trace_scan_reports = env_flag_enabled("MK1_SCAN_TRACE");
     dev->trace_all_pipes = env_flag_enabled("MK1_ALL_PIPE_TRACE");
     pthread_mutex_init(&dev->reply_lock, NULL);
+    pthread_mutex_init(&dev->io_lock, NULL);
 
     dev->service = find_matching_usb_service(dev->serial, sizeof(dev->serial));
     if (dev->service == IO_OBJECT_NULL) {
         fprintf(stderr, "[mk1-usb] MK1 not present in USB registry (VID=0x%04x PID=0x%04x)\n",
                 MK1_VENDOR_ID, MK1_PRODUCT_ID);
+        pthread_mutex_destroy(&dev->io_lock);
         pthread_mutex_destroy(&dev->reply_lock);
         free(dev);
         return NULL;
@@ -1949,6 +1996,7 @@ void mk1_device_close(mk1_device_t *dev)
         dev->service = IO_OBJECT_NULL;
     }
 
+    pthread_mutex_destroy(&dev->io_lock);
     pthread_mutex_destroy(&dev->reply_lock);
     free(dev);
     fprintf(stderr, "[mk1-usb] device closed\n");
@@ -2003,6 +2051,8 @@ bool mk1_device_write_endpoint(mk1_device_t *dev,
 {
     UInt8 pipe_ref = 0;
     IOReturn kr;
+    uint64_t start_ns = 0;
+    uint64_t end_ns = 0;
 
     if (!dev || !dev->interface || !data || len == 0) {
         return false;
@@ -2014,8 +2064,18 @@ bool mk1_device_write_endpoint(mk1_device_t *dev,
         return false;
     }
 
+    start_ns = mk1_now_ns();
+    pthread_mutex_lock(&dev->io_lock);
     kr = (*dev->interface)->WritePipe(dev->interface, pipe_ref, (void *)data, (UInt32)len);
+    pthread_mutex_unlock(&dev->io_lock);
+    end_ns = mk1_now_ns();
     if (kr != kIOReturnSuccess) {
+        mk1_timing_log("usb-out endpoint=0x%02x pipe=%u len=%zu ok=0 dur_us=%llu err=0x%08x",
+                       endpoint_number,
+                       pipe_ref,
+                       len,
+                       (unsigned long long)((end_ns - start_ns) / 1000ULL),
+                       kr);
         fprintf(stderr,
                 "[mk1-usb] WritePipe(pipe=%u endpoint=0x%02x len=%zu) failed: 0x%08x\n",
                 pipe_ref,
@@ -2025,6 +2085,12 @@ bool mk1_device_write_endpoint(mk1_device_t *dev,
         log_short_bytes("write payload", data, len, 96);
         return false;
     }
+
+    mk1_timing_log("usb-out endpoint=0x%02x pipe=%u len=%zu ok=1 dur_us=%llu",
+                   endpoint_number,
+                   pipe_ref,
+                   len,
+                   (unsigned long long)((end_ns - start_ns) / 1000ULL));
 
     if (mk1_verbose_io_enabled()) {
         fprintf(stderr,

@@ -80,6 +80,7 @@ void mk1_device_stop(mk1_device_t *dev);
 // Set log file for encoder/knob diagnostics (len33 changed-byte dumps).
 // Pass NULL to disable. Called from main.c after opening log files.
 void mk1_device_set_encoder_log(FILE *fp);
+void mk1_device_set_timing_log(FILE *fp);
 
 // Output
 bool mk1_device_write_endpoint(mk1_device_t *dev,

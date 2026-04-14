@@ -99,6 +99,39 @@ Targets build order: `mk1-usb` → `mk1-ipc` → `mk1-bridge`
 
 The `mk1-shim` target builds independently.
 
+## Running
+
+The bridge now enables partial display updates by default. Small display regions
+are sent as partial ST7529 window writes, while larger redraws fall back to the
+existing full-frame path.
+
+Recommended default run:
+
+```bash
+./build/Debug/mk1-bridge
+```
+
+Tune the partial-display cutoff with:
+
+```bash
+./build/Debug/mk1-bridge --partial_display_max=2048
+./build/Debug/mk1-bridge --partial_display_max=3072
+```
+
+Other useful flags:
+
+```bash
+./build/Debug/mk1-bridge --display_tick_ms=16
+./build/Debug/mk1-bridge --no-partial-display
+./build/Debug/mk1-bridge --help
+```
+
+For latency instrumentation during testing:
+
+```bash
+MK1_TIMING_TRACE=1 ./build/Debug/mk1-bridge --partial_display_max=2048
+```
+
 ## Status
 
 - [x] Directory structure and project scaffold

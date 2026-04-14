@@ -14,6 +14,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <spawn.h>
+#include <stdarg.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 
@@ -40,11 +41,13 @@ static FILE *g_log_led     = NULL;
 static FILE *g_log_display = NULL;
 static FILE *g_log_buttons = NULL;
 static FILE *g_log_encoder = NULL;
+static FILE *g_log_timing  = NULL;
 
 // When g_quiet is set, only bridge-status messages stay on stderr so the
 // terminal remains usable for interactive prompts. Category logs still go to
 // their log files as usual.
 static bool g_quiet = false;
+static bool g_timing_trace = false;
 static pid_t g_spawned_maschine_pid = -1;
 static bool g_aux_mode_started = false;
 
@@ -61,6 +64,35 @@ static bool g_aux_mode_started = false;
 #define DLOG(fmt, ...)   LOG(g_log_display, "[display] " fmt, ##__VA_ARGS__)
 #define BTNLOG(fmt, ...) LOG(g_log_buttons, "[buttons] " fmt, ##__VA_ARGS__)
 #define ENCLOG(fmt, ...) LOG(g_log_encoder, "[encoder] " fmt, ##__VA_ARGS__)
+
+static uint64_t timing_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void TLOG(const char *fmt, ...)
+{
+    va_list args;
+
+    if (!g_timing_trace) return;
+
+    va_start(args, fmt);
+    fprintf(stderr, "[timing]  ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+
+    if (g_log_timing) {
+        va_start(args, fmt);
+        fprintf(g_log_timing, "[timing]  ");
+        vfprintf(g_log_timing, fmt, args);
+        fprintf(g_log_timing, "\n");
+        fflush(g_log_timing);
+        va_end(args);
+    }
+}
 
 static void open_logs(void)
 {
@@ -84,19 +116,23 @@ static void open_logs(void)
     OPEN_LOG(g_log_display, "display.log")
     OPEN_LOG(g_log_buttons, "buttons.log")
     OPEN_LOG(g_log_encoder, "encoder.log")
+    OPEN_LOG(g_log_timing,  "timing.log")
 
 #undef OPEN_LOG
 
     mk1_device_set_encoder_log(g_log_encoder);
+    mk1_device_set_timing_log(g_log_timing);
 }
 
 static void close_logs(void)
 {
+    mk1_device_set_timing_log(NULL);
     if (g_log_bridge)  { fclose(g_log_bridge);  g_log_bridge  = NULL; }
     if (g_log_led)     { fclose(g_log_led);     g_log_led     = NULL; }
     if (g_log_display) { fclose(g_log_display); g_log_display = NULL; }
     if (g_log_buttons) { fclose(g_log_buttons); g_log_buttons = NULL; }
     if (g_log_encoder) { fclose(g_log_encoder); g_log_encoder = NULL; }
+    if (g_log_timing)  { fclose(g_log_timing);  g_log_timing  = NULL; }
     mk1_device_set_encoder_log(NULL);
 }
 
@@ -329,6 +365,44 @@ static void poll_maschine_process(void)
 
 // Per-display framebuffers — composited here, full frame always sent to hardware.
 static uint8_t g_display_fb[DISPLAY_COUNT][DISPLAY_FB_BYTES];
+static int g_display_tick_ms = 16;
+static uint32_t g_display_dirty_mask = 0;
+static uint64_t g_display_batch_start_ns[DISPLAY_COUNT] = {0};
+static uint16_t g_display_row_start[DISPLAY_COUNT] = {0};
+static uint16_t g_display_row_end[DISPLAY_COUNT] = {0};
+static uint16_t g_display_byte_x_start[DISPLAY_COUNT] = {0};
+static uint16_t g_display_byte_x_end[DISPLAY_COUNT] = {0};
+static bool g_display_have_region[DISPLAY_COUNT] = {0};
+static dispatch_source_t g_display_flush_timer = NULL;
+static dispatch_queue_t g_display_flush_queue = NULL;
+static bool g_display_flush_active = false;
+static pthread_mutex_t g_display_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_display_partial_flush = false;
+static size_t g_display_partial_max_payload = 2048;
+
+typedef struct {
+    bridge_t *br;
+    uint32_t dirty_mask;
+    uint64_t batch_start_ns[DISPLAY_COUNT];
+    uint8_t frames[DISPLAY_COUNT][DISPLAY_FB_BYTES];
+    uint16_t row_start[DISPLAY_COUNT];
+    uint16_t row_end[DISPLAY_COUNT];
+    uint16_t byte_x_start[DISPLAY_COUNT];
+    uint16_t byte_x_end[DISPLAY_COUNT];
+    bool have_region[DISPLAY_COUNT];
+} display_flush_job_t;
+
+static void send_full_display_frame(bridge_t *br, uint8_t disp_idx, const uint8_t *fb);
+static bool send_partial_display_frame(bridge_t *br,
+                                       uint8_t disp_idx,
+                                       const uint8_t *fb,
+                                       uint16_t row_start,
+                                       uint16_t row_end,
+                                       uint16_t byte_x_start,
+                                       uint16_t byte_x_end,
+                                       size_t *payload_len_out);
+static void flush_display_updates(bridge_t *br);
+static void start_display_flush_timer(bridge_t *br);
 
 // ---------------------------------------------------------------------------
 // Status screen — "Open Maschine" shown at startup and when Maschine exits
@@ -562,6 +636,244 @@ static void send_fb_to_display(bridge_t *br, uint8_t usb_base, const uint8_t *fb
     free(frame);
 }
 
+static void send_full_display_frame(bridge_t *br, uint8_t disp_idx, const uint8_t *fb)
+{
+    uint64_t start_ns = timing_now_ns();
+    uint8_t usb_base;
+    static const uint8_t row_cmd[3] = { 0x75, 0x00, 0x3f };   // rows 0–63
+    static const uint8_t col_cmd[3] = { 0x15, 0x00, 0x54 };   // cols 0–84
+    uint8_t *frame;
+    size_t total;
+    size_t offset;
+    bool ok;
+
+    if (!br || !br->usb || disp_idx >= DISPLAY_COUNT) return;
+
+    usb_base = disp_idx == 0 ? 0x00 : 0x02;
+    TLOG("usb-display-begin disp=%u usb_base=0x%02x frame_bytes=%d ts_ns=%llu",
+         disp_idx, usb_base, 1 + DISPLAY_FB_BYTES, (unsigned long long)start_ns);
+    mk1_set_display(br->usb, usb_base, row_cmd, sizeof(row_cmd));
+    mk1_set_display(br->usb, usb_base, col_cmd, sizeof(col_cmd));
+
+    frame = malloc(1 + DISPLAY_FB_BYTES);
+    if (!frame) return;
+    frame[0] = ST7529_RAMWR;
+    memcpy(frame + 1, fb, DISPLAY_FB_BYTES);
+
+    total = 1 + DISPLAY_FB_BYTES;
+    offset = 0;
+    ok = true;
+
+    while (offset < total && ok) {
+        size_t chunk = (total - offset) > EP8_CHUNK_MAX
+                     ? EP8_CHUNK_MAX : (total - offset);
+        uint8_t disp = (offset == 0) ? usb_base : (uint8_t)(usb_base | 0x01);
+        ok = mk1_set_display(br->usb, disp, frame + offset, chunk);
+        offset += chunk;
+    }
+
+    free(frame);
+
+    if (!ok) {
+        DLOG("EP8 write failed");
+    } else {
+        DLOG("sent full frame (%d bytes) to display %u OK", 1 + DISPLAY_FB_BYTES, usb_base);
+    }
+    TLOG("usb-display-end disp=%u usb_base=0x%02x ok=%d dur_us=%llu",
+         disp_idx,
+         usb_base,
+         ok ? 1 : 0,
+         (unsigned long long)((timing_now_ns() - start_ns) / 1000ULL));
+}
+
+static bool send_partial_display_frame(bridge_t *br,
+                                       uint8_t disp_idx,
+                                       const uint8_t *fb,
+                                       uint16_t row_start,
+                                       uint16_t row_end,
+                                       uint16_t byte_x_start,
+                                       uint16_t byte_x_end,
+                                       size_t *payload_len_out)
+{
+    uint64_t start_ns = timing_now_ns();
+    uint8_t usb_base;
+    uint8_t row_cmd[3];
+    uint8_t col_cmd[3];
+    uint8_t *frame = NULL;
+    size_t rows;
+    size_t bytes_per_row;
+    size_t payload_len;
+    size_t total;
+    size_t offset;
+    bool ok = true;
+
+    if (!br || !br->usb || !fb || disp_idx >= DISPLAY_COUNT) return false;
+    if (row_start > row_end || row_end >= DISPLAY_ROWS) return false;
+    if (byte_x_start > byte_x_end || byte_x_end >= DISPLAY_BYTES_PER_ROW) return false;
+    if ((byte_x_start & 1u) != 0 || (byte_x_end & 1u) != 1) return false;
+
+    rows = (size_t)(row_end - row_start + 1);
+    bytes_per_row = (size_t)(byte_x_end - byte_x_start + 1);
+    if ((bytes_per_row & 1u) != 0) return false;
+
+    usb_base = disp_idx == 0 ? 0x00 : 0x02;
+    row_cmd[0] = 0x75;
+    row_cmd[1] = (uint8_t)row_start;
+    row_cmd[2] = (uint8_t)row_end;
+    col_cmd[0] = 0x15;
+    col_cmd[1] = (uint8_t)(byte_x_start / 2);
+    col_cmd[2] = (uint8_t)(byte_x_end / 2);
+
+    payload_len = rows * bytes_per_row;
+    if (payload_len_out) *payload_len_out = payload_len;
+    frame = malloc(1 + payload_len);
+    if (!frame) return false;
+    frame[0] = ST7529_RAMWR;
+    for (size_t r = 0; r < rows; r++) {
+        memcpy(frame + 1 + r * bytes_per_row,
+               fb + ((size_t)row_start + r) * DISPLAY_BYTES_PER_ROW + byte_x_start,
+               bytes_per_row);
+    }
+
+    TLOG("usb-display-partial-begin disp=%u usb_base=0x%02x rows=%u-%u cols=%u-%u frame_bytes=%zu ts_ns=%llu",
+         disp_idx,
+         usb_base,
+         row_start,
+         row_end,
+         (unsigned)(byte_x_start / 2),
+         (unsigned)(byte_x_end / 2),
+         1 + payload_len,
+         (unsigned long long)start_ns);
+
+    mk1_set_display(br->usb, usb_base, row_cmd, sizeof(row_cmd));
+    mk1_set_display(br->usb, usb_base, col_cmd, sizeof(col_cmd));
+
+    total = 1 + payload_len;
+    offset = 0;
+    while (offset < total && ok) {
+        size_t chunk = (total - offset) > EP8_CHUNK_MAX
+                     ? EP8_CHUNK_MAX : (total - offset);
+        uint8_t disp = (offset == 0) ? usb_base : (uint8_t)(usb_base | 0x01);
+        ok = mk1_set_display(br->usb, disp, frame + offset, chunk);
+        offset += chunk;
+    }
+
+    free(frame);
+
+    TLOG("usb-display-partial-end disp=%u usb_base=0x%02x ok=%d dur_us=%llu payload=%zu",
+         disp_idx,
+         usb_base,
+         ok ? 1 : 0,
+         (unsigned long long)((timing_now_ns() - start_ns) / 1000ULL),
+         payload_len);
+    return ok;
+}
+
+static void flush_display_updates(bridge_t *br)
+{
+    display_flush_job_t *job;
+
+    pthread_mutex_lock(&g_display_lock);
+    if (g_display_flush_active || g_display_dirty_mask == 0) {
+        pthread_mutex_unlock(&g_display_lock);
+        return;
+    }
+    g_display_flush_active = true;
+    job = calloc(1, sizeof(*job));
+    if (!job) {
+        g_display_flush_active = false;
+        pthread_mutex_unlock(&g_display_lock);
+        return;
+    }
+    job->br = br;
+    job->dirty_mask = g_display_dirty_mask;
+    memcpy(job->batch_start_ns, g_display_batch_start_ns, sizeof(g_display_batch_start_ns));
+    memcpy(job->frames, g_display_fb, sizeof(g_display_fb));
+    memcpy(job->row_start, g_display_row_start, sizeof(g_display_row_start));
+    memcpy(job->row_end, g_display_row_end, sizeof(g_display_row_end));
+    memcpy(job->byte_x_start, g_display_byte_x_start, sizeof(g_display_byte_x_start));
+    memcpy(job->byte_x_end, g_display_byte_x_end, sizeof(g_display_byte_x_end));
+    memcpy(job->have_region, g_display_have_region, sizeof(g_display_have_region));
+    g_display_dirty_mask = 0;
+    memset(g_display_batch_start_ns, 0, sizeof(g_display_batch_start_ns));
+    memset(g_display_row_start, 0, sizeof(g_display_row_start));
+    memset(g_display_row_end, 0, sizeof(g_display_row_end));
+    memset(g_display_byte_x_start, 0, sizeof(g_display_byte_x_start));
+    memset(g_display_byte_x_end, 0, sizeof(g_display_byte_x_end));
+    memset(g_display_have_region, 0, sizeof(g_display_have_region));
+    pthread_mutex_unlock(&g_display_lock);
+
+    dispatch_async(g_display_flush_queue, ^{
+        for (uint8_t disp_idx = 0; disp_idx < DISPLAY_COUNT; disp_idx++) {
+            size_t partial_payload = 0;
+
+            if ((job->dirty_mask & (1u << disp_idx)) == 0) continue;
+            if (job->batch_start_ns[disp_idx] != 0) {
+                TLOG("display-batch-flush disp=%u batch_us=%llu",
+                     disp_idx,
+                     (unsigned long long)((timing_now_ns() - job->batch_start_ns[disp_idx]) / 1000ULL));
+            }
+
+            if (g_display_partial_flush &&
+                job->have_region[disp_idx]) {
+                partial_payload =
+                    ((size_t)(job->row_end[disp_idx] - job->row_start[disp_idx] + 1)) *
+                    ((size_t)(job->byte_x_end[disp_idx] - job->byte_x_start[disp_idx] + 1));
+                if (partial_payload <= g_display_partial_max_payload &&
+                    send_partial_display_frame(job->br,
+                                               disp_idx,
+                                               job->frames[disp_idx],
+                                               job->row_start[disp_idx],
+                                               job->row_end[disp_idx],
+                                               job->byte_x_start[disp_idx],
+                                               job->byte_x_end[disp_idx],
+                                               NULL)) {
+                    continue;
+                }
+                TLOG("usb-display-partial-skip disp=%u payload=%zu limit=%zu",
+                     disp_idx, partial_payload, g_display_partial_max_payload);
+            }
+            send_full_display_frame(job->br, disp_idx, job->frames[disp_idx]);
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            pthread_mutex_lock(&g_display_lock);
+            g_display_flush_active = false;
+            bool have_more = (g_display_dirty_mask != 0);
+            pthread_mutex_unlock(&g_display_lock);
+            free(job);
+            if (have_more) {
+                flush_display_updates(br);
+            }
+        });
+    });
+}
+
+static void start_display_flush_timer(bridge_t *br)
+{
+    if (g_display_flush_timer) return;
+    if (!g_display_flush_queue) {
+        g_display_flush_queue = dispatch_queue_create("com.dragco.mk1.display-flush",
+                                                      DISPATCH_QUEUE_SERIAL);
+    }
+
+    g_display_flush_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                   dispatch_get_main_queue());
+    if (!g_display_flush_timer) return;
+
+    dispatch_source_set_timer(g_display_flush_timer,
+                              dispatch_time(DISPATCH_TIME_NOW,
+                                            (int64_t)g_display_tick_ms * NSEC_PER_MSEC),
+                              (uint64_t)g_display_tick_ms * NSEC_PER_MSEC,
+                              (uint64_t)1 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_display_flush_timer, ^{
+        if (!g_running) return;
+        if (g_display_dirty_mask == 0) return;
+        flush_display_updates(br);
+    });
+    dispatch_resume(g_display_flush_timer);
+}
+
 // Render and send the disconnected status screens.
 static void show_status_screen(bridge_t *br)
 {
@@ -579,6 +891,8 @@ static void show_status_screen(bridge_t *br)
 
 static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 {
+    uint64_t start_ns = timing_now_ns();
+
     if (!br->usb) {
         DLOG("no USB device");
         return;
@@ -620,6 +934,8 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
 
     DLOG("disp=%u y=%u x=%u h=%u w=%u bytes_per_row=%zu pixel_len=%u",
          disp_idx, y, x, h, w, bytes_per_row, pixel_len);
+    TLOG("ipc-rx display disp=%u raw_len=%zu y=%u x=%u h=%u w=%u pixel_len=%u ts_ns=%llu",
+         disp_idx, raw_len, y, x, h, w, pixel_len, (unsigned long long)start_ns);
 
     const uint8_t *pixels = raw_msg + IPC_DISPLAY_HDR_LEN;
 
@@ -635,45 +951,28 @@ static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len
     }
 
     // Composite update region into the local framebuffer at the correct (y, x) position.
+    pthread_mutex_lock(&g_display_lock);
     for (uint16_t r = 0; r < h; r++) {
         memcpy(g_display_fb[disp_idx] + (y + r) * DISPLAY_BYTES_PER_ROW + byte_x,
                pixels + r * bytes_per_row,
                bytes_per_row);
     }
-
-    // Reset address window before RAMWR. No 0x30 (enter extension) needed —
-    // the display stays in extension mode between frames (init ends in extension mode,
-    // no 0x31 is ever sent). pcap confirms: steady-state frames send 0x75+0x15+RAMWR only.
-    uint8_t usb_base = disp_idx == 0 ? 0x00 : 0x02;
-    static const uint8_t row_cmd[3] = { 0x75, 0x00, 0x3f };   // rows 0–63
-    static const uint8_t col_cmd[3] = { 0x15, 0x00, 0x54 };   // cols 0–84
-    mk1_set_display(br->usb, usb_base, row_cmd, sizeof(row_cmd));
-    mk1_set_display(br->usb, usb_base, col_cmd, sizeof(col_cmd));
-
-    uint8_t *frame = malloc(1 + DISPLAY_FB_BYTES);
-    if (!frame) return;
-    frame[0] = ST7529_RAMWR;
-    memcpy(frame + 1, g_display_fb[disp_idx], DISPLAY_FB_BYTES);
-
-    size_t total = 1 + DISPLAY_FB_BYTES;
-    size_t offset = 0;
-    bool ok = true;
-
-    while (offset < total && ok) {
-        size_t chunk = (total - offset) > EP8_CHUNK_MAX
-                     ? EP8_CHUNK_MAX : (total - offset);
-        uint8_t disp = (offset == 0) ? usb_base : (uint8_t)(usb_base | 0x01);
-        ok = mk1_set_display(br->usb, disp, frame + offset, chunk);
-        offset += chunk;
+    if (g_display_batch_start_ns[disp_idx] == 0) {
+        g_display_batch_start_ns[disp_idx] = start_ns;
     }
-
-    free(frame);
-
-    if (!ok) {
-        DLOG("EP8 write failed");
-    } else {
-        DLOG("sent full frame (%d bytes) to display %u OK", 1 + DISPLAY_FB_BYTES, usb_base);
-    }
+    // Partial mode performs best when we keep the newest region instead of
+    // unioning many small updates into a large near-full-frame box.
+    g_display_row_start[disp_idx] = y;
+    g_display_row_end[disp_idx] = (uint16_t)(y + h - 1);
+    g_display_byte_x_start[disp_idx] = (uint16_t)byte_x;
+    g_display_byte_x_end[disp_idx] = (uint16_t)(byte_x + bytes_per_row - 1);
+    g_display_have_region[disp_idx] = true;
+    g_display_dirty_mask |= (1u << disp_idx);
+    pthread_mutex_unlock(&g_display_lock);
+    TLOG("display-batch-queued disp=%u dirty_mask=0x%x queue_us=%llu",
+         disp_idx,
+         g_display_dirty_mask,
+         (unsigned long long)((timing_now_ns() - start_ns) / 1000ULL));
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +999,9 @@ static void project_capture_on_led(const uint8_t *logical, size_t logical_len,
                                    const uint8_t *phys, size_t phys_len);
 static bool env_truthy(const char *name);
 static int env_int_or_default(const char *name, int fallback);
+static bool parse_size_arg(const char *arg, const char *prefix, size_t *out_value);
+static bool parse_int_arg(const char *arg, const char *prefix, int *out_value);
+static void print_usage(const char *prog);
 
 typedef enum {
     MK1_LED_EVIDENCE_PROVISIONAL = 0,
@@ -1254,6 +1556,8 @@ static void show_disconnected_led_state(bridge_t *br)
 static void on_cmd(uint32_t cmd_type, const uint8_t *raw_msg, size_t raw_len, void *ctx)
 {
     bridge_t *br = (bridge_t *)ctx;
+    TLOG("ipc-rx cmd=0x%08x raw_len=%zu ts_ns=%llu",
+         cmd_type, raw_len, (unsigned long long)timing_now_ns());
     switch (cmd_type) {
         case NI_CMD_DISPLAY:
             forward_display(br, raw_msg, raw_len);
@@ -1385,7 +1689,15 @@ static void send_pad_record(mk1_server_t *srv,
     memcpy(buf + 20, &event_type, 4);
     memcpy(buf + 24, &value,      4);
 
-    mk1_server_send_event(srv, buf, sizeof(buf));
+    uint64_t start_ns = timing_now_ns();
+    bool ok = mk1_server_send_event(srv, buf, sizeof(buf));
+    TLOG("ipc-tx pad idx=%u ev=%u ok=%d dur_us=%llu value=%.4f hw_ts_ns=%llu",
+         pad_index,
+         event_type,
+         ok ? 1 : 0,
+         (unsigned long long)((timing_now_ns() - start_ns) / 1000ULL),
+         (double)value,
+         (unsigned long long)ts_ns);
 }
 
 static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
@@ -1477,7 +1789,13 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
         }
     }
 
-    mk1_server_send_event(br->srv, ev->raw, ev->len);
+    uint64_t start_ns = timing_now_ns();
+    bool ok = mk1_server_send_event(br->srv, ev->raw, ev->len);
+    TLOG("ipc-tx button type=0x%08x len=%zu ok=%d dur_us=%llu",
+         msg_type,
+         ev->len,
+         ok ? 1 : 0,
+         (unsigned long long)((timing_now_ns() - start_ns) / 1000ULL));
 }
 
 static bool env_truthy(const char *name)
@@ -1494,6 +1812,40 @@ static int env_int_or_default(const char *name, int fallback)
     long parsed = strtol(value, &end, 10);
     if (!end || *end != '\0') return fallback;
     return (int)parsed;
+}
+
+static bool parse_size_arg(const char *arg, const char *prefix, size_t *out_value)
+{
+    const char *value = NULL;
+    char *end = NULL;
+    unsigned long long parsed = 0;
+
+    if (!arg || !prefix || !out_value) return false;
+    if (strncmp(arg, prefix, strlen(prefix)) != 0) return false;
+    value = arg + strlen(prefix);
+    if (!value[0]) return false;
+
+    parsed = strtoull(value, &end, 10);
+    if (!end || *end != '\0') return false;
+    *out_value = (size_t)parsed;
+    return true;
+}
+
+static bool parse_int_arg(const char *arg, const char *prefix, int *out_value)
+{
+    size_t parsed = 0;
+
+    if (!out_value) return false;
+    if (!parse_size_arg(arg, prefix, &parsed)) return false;
+    *out_value = (int)parsed;
+    return true;
+}
+
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [--partial_display_max=N] [--display_tick_ms=N] [--no-partial-display]\n",
+            prog ? prog : "mk1-bridge");
 }
 
 static const char *maschine_exec_path(void)
@@ -2617,7 +2969,41 @@ static void on_device_removed(void *ctx)
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    const char *timing_env = getenv("MK1_TIMING_TRACE");
+
+    g_timing_trace = timing_env && timing_env[0] && strcmp(timing_env, "0") != 0;
+    g_display_tick_ms = env_int_or_default("MK1_DISPLAY_TICK_MS", 16);
+    if (g_display_tick_ms <= 0) g_display_tick_ms = 16;
+    g_display_partial_flush = true;
+    if (env_truthy("MK1_DISPLAY_PARTIAL")) {
+        g_display_partial_flush = true;
+    }
+    g_display_partial_max_payload =
+        (size_t)env_int_or_default("MK1_DISPLAY_PARTIAL_MAX", 2048);
+    if (g_display_partial_max_payload == 0) g_display_partial_max_payload = 2048;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-partial-display") == 0) {
+            g_display_partial_flush = false;
+            continue;
+        }
+        if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if (parse_size_arg(argv[i], "--partial_display_max=", &g_display_partial_max_payload)) {
+            if (g_display_partial_max_payload == 0) g_display_partial_max_payload = 2048;
+            continue;
+        }
+        if (parse_int_arg(argv[i], "--display_tick_ms=", &g_display_tick_ms)) {
+            if (g_display_tick_ms <= 0) g_display_tick_ms = 16;
+            continue;
+        }
+
+        fprintf(stderr, "[bridge]  unknown argument: %s\n", argv[i]);
+        print_usage(argv[0]);
+        return 1;
+    }
 
     open_logs();
 
@@ -2625,6 +3011,9 @@ int main(int argc, char **argv)
     signal(SIGTERM, sig_handler);
 
     BLOG("mk1-bridge starting");
+    BLOG("display flush scheduler tick=%d ms", g_display_tick_ms);
+    BLOG("display partial flush=%s", g_display_partial_flush ? "enabled" : "disabled");
+    BLOG("display partial max payload=%zu", g_display_partial_max_payload);
 
     if (env_truthy("MK1_LED_PROBE") || (env_truthy("MK1_LED_VERIFY") && !guided_verify_with_maschine())) {
         g_guided_mode_only = true;
@@ -2670,6 +3059,7 @@ int main(int argc, char **argv)
     if (!g_bridge.hotplug) {
         BLOG("WARNING: hot-plug watcher failed to start");
     }
+    start_display_flush_timer(&g_bridge);
 
     if (!g_guided_mode_only) {
         maybe_launch_maschine();
@@ -2680,6 +3070,10 @@ int main(int argc, char **argv)
 
     if (g_bridge.usb && g_bridge.srv && mk1_server_is_connected(g_bridge.srv)) {
         mk1_server_send_device_off(g_bridge.srv);
+    }
+    if (g_display_flush_timer) {
+        dispatch_source_cancel(g_display_flush_timer);
+        g_display_flush_timer = NULL;
     }
     mk1_hotplug_stop(g_bridge.hotplug);
     if (g_bridge.srv) {

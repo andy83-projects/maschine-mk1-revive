@@ -17,12 +17,10 @@ OUT_PKG="${OUT_DIR}/mk1-bridge-${PKG_VERSION}-${CONFIGURATION}.pkg"
 STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mk1-bridge-pkg-root.XXXXXX")"
 trap 'rm -rf "${STAGE_ROOT}"' EXIT INT TERM
 
-if [ ! -x "${BINARY_PATH}" ]; then
-    xcodebuild -project "${REPO_ROOT}/maschine-mk1-revive.xcodeproj" \
-        -scheme mk1-bridge \
-        -configuration "${CONFIGURATION}" \
-        build
-fi
+xcodebuild -project "${REPO_ROOT}/maschine-mk1-revive.xcodeproj" \
+    -scheme mk1-bridge \
+    -configuration "${CONFIGURATION}" \
+    build
 
 install -d "${STAGE_ROOT}/usr/local/bin"
 install -d "${STAGE_ROOT}/Library/LaunchAgents"

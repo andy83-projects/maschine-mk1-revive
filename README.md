@@ -152,6 +152,7 @@ MK1_TIMING_TRACE=1 ./build/Debug/mk1-bridge --partial_display_max=2048
 - [x] USB hot-plug — bridge survives device unplug/replug; starts before device is connected
 - [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine can take 5-30 seconds to reconnect; restarting Maschine may be a faster path
 - [ ] First-launch input miss — after a fresh Maschine launch, the first button or pad press is ignored; second press works and lights correctly
+- [ ] Apple Silicon project-load LED anomaly — some projects still assert errant dim group LEDs on load; the non-group dim cluster now has an env-flagged workaround, but remaining group-button behavior still needs to be isolated and fixed cleanly
 - [ ] launchd agent plist
 - [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)
 

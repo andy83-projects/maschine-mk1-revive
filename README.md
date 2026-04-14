@@ -112,7 +112,7 @@ The `mk1-shim` target builds independently.
 - [x] Pad input events — EP4 64-byte reports decoded; baseline from resting scan-table reports; pressure/hit-on/off forwarded
 - [x] Pad pressure throttle — updates gated at ≥200-count change to prevent 700Hz IPC flooding
 - [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded
-- [~] Display backlight stays on — toggles briefly on certain button presses (under investigation)
+- [x] Display backlight stays on — no longer toggles on button presses (resolved)
 - [x] Status screen — "Open Maschine" shown on both displays at start and when Maschine exits
 - [x] Master Section knobs — Volume, Tempo, Swing encoder events forwarded via IPC
 - [x] Screen area encoders — all 8 encoders mapped (byte pairs confirmed from hardware capture)

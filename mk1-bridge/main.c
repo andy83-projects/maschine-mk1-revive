@@ -880,6 +880,13 @@ static void emit_led_state(bridge_t *br, const uint8_t *led_logical, size_t full
 
     uint8_t device_leds[62] = {0};
 
+    // Packet A pad rubbers: IPC logical[0..15] = CABL m_leds[0..15] (Pad4..Pad13, hardware order).
+    // These also correlate with group membership — when a group is selected, its representative
+    // pad rubber shows 0x32 at the same logical index as the pad's CABL rubber slot.
+    for (size_t i = 0; i < 16 && i < full_len; i++) {
+        device_leds[i] = led_logical[i];
+    }
+
     // Scene-row: logical[] index → device_leds[] slot (absolute device order).
     static const struct { uint8_t log_idx; uint8_t dev_slot; } k_scene_row[] = {
         { 16, 16 },  // Mute          (assumed by position)
@@ -916,16 +923,29 @@ static void emit_led_state(bridge_t *br, const uint8_t *led_logical, size_t full
     // CABL places TransportLeft/Loop (Restart) at the start of the second window.
     if (full_len > 30) device_leds[31] = led_logical[30];  // TransportLeft
 
-    // Apple Silicon extended slots: logical[41..56] -> device_leds[42..57]
-    // (Snap through Note Repeat). Starts at 41; the +1 offset skips Auto Write
-    // at device_leds[41] which is handled separately.
+    // Apple Silicon second-block: IPC logical[N] -> device_leds[N+1] for N=32..56.
     //
-    // Group buttons (phys[3..10] = device_leds[33..40]) are driven by
-    // logical[1..12] via k_hw_by_logical above and must NOT be touched here.
-    // Pad rubbers at logical[37..52] also must not reach group positions.
-    for (uint8_t li = 41; li <= 56 && (size_t)li < full_len; li++) {
-        uint8_t dev_slot = (li >= 41) ? (uint8_t)(li + 1) : li;
-        if (dev_slot < 62) device_leds[dev_slot] = led_logical[li];
+    // The IPC payload is the CABL m_leds[] array with Unused1 (m_leds[30]) skipped,
+    // shifting all subsequent indices by -1:
+    //   logical[32] = m_leds[33] = GroupH  -> device_leds[33] = phys[3]
+    //   logical[33] = m_leds[34] = GroupG  -> device_leds[34] = phys[4]
+    //   logical[34] = m_leds[35] = GroupD  -> device_leds[35] = phys[5]
+    //   logical[35] = m_leds[36] = GroupC  -> device_leds[36] = phys[6]
+    //   logical[36] = m_leds[37] = GroupF  -> device_leds[37] = phys[7]
+    //   logical[37] = m_leds[38] = GroupE  -> device_leds[38] = phys[8]
+    //   logical[38] = m_leds[39] = GroupB  -> device_leds[39] = phys[9]
+    //   logical[39] = m_leds[40] = GroupA  -> device_leds[40] = phys[10]
+    //   logical[40] = m_leds[41] = AutoWrite -> device_leds[41] = phys[11]
+    //   logical[41] = m_leds[42] = Snap    -> device_leds[42] = phys[12]
+    //   ...
+    //   logical[56] = m_leds[57] = NoteRepeat -> device_leds[57] = phys[27]
+    //
+    // This also overwrites any stale pad-rubber values that k_hw_by_logical
+    // placed into group positions (logical[0..15] = CABL pad rubbers land on
+    // phys[3..10] via the legacy table; this pass corrects them).
+    for (uint8_t li = 32; li <= 56 && (size_t)li < full_len; li++) {
+        uint8_t dev_slot = (uint8_t)(li + 1);
+        if (dev_slot < 62 && led_logical[li] != 0) device_leds[dev_slot] = led_logical[li];
     }
 
     if (g_led_autowrite_pressed) {
@@ -1280,6 +1300,7 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
         uint32_t pressed = 0;
         memcpy(&control_index, ev->raw + 16, 4);
         memcpy(&pressed,       ev->raw + 20, 4);
+        BTNLOG("button control_index=0x%x pressed=%u", control_index, pressed);
         if (control_index == 0x1c) {
             bool new_pressed = (pressed != 0);
             if (g_led_autowrite_pressed != new_pressed) {

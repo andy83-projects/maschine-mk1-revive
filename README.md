@@ -28,11 +28,12 @@ Entirely userspace. No DriverKit, no kernel code, no special entitlements.
 registers the `NIHWMainHandler` CFMessagePort itself. It owns both ends: full IPC
 handshake with the Maschine app and direct IOKit USB bulk transfers to the hardware.
 
-Working as of 2026-04-08:
+Working as of 2026-04-13:
 - Maschine software detects the MK1 in its controller list
 - Both displays render correctly (ST7529, EP8 bulk, 170×64 grayscale)
 - Status screen ("Open Maschine") shown on both displays at bridge start and when Maschine exits
-- Button/group/transport LEDs respond correctly; pad LEDs now light with correct pad addressing
+- All button and transport LEDs confirmed working: pad-row (Scene/Mute/Solo/Select/Duplicate/Navigate/Pad Mode/Pattern), transport (Play/Record/Restart/Erase/Grid/Shift/TransportLeft/TransportRight), screen area (SA1–SA8), Browse, Note Repeat, Snap, Control, Step, Modules Left/Right, Auto Write, Group A–H
+- Pad rubber LEDs light correctly per active group and pad hits
 - Pads register velocity and pressure (EP4 64-byte reports, 12-bit ADC, IPC forwarded)
   - Pressure updates throttled to ≥5% change threshold to prevent IPC flooding at 700Hz
 - Group, transport, and screen buttons registered (EP1 short reports)
@@ -107,7 +108,7 @@ The `mk1-shim` target builds independently.
 - [x] Bridge daemon skeleton (`mk1-bridge`) — Maschine detects MK1 in controller list
 - [x] Display init (EP8, ST7529 17-command sequence; UI-mode scan direction `0xbc [0x02,0x01,0x01]`)
 - [x] LCD display pixel updates — full framebuffer composite + RAMWR; display renders correctly
-- [x] LED forwarding — button/group/transport LEDs work; pad LEDs now light with correct addressing
+- [x] LED forwarding — all button/group/transport/pad-row/SA/pad-rubber LEDs confirmed working
 - [x] Pad input events — EP4 64-byte reports decoded; baseline from resting scan-table reports; pressure/hit-on/off forwarded
 - [x] Pad pressure throttle — updates gated at ≥200-count change to prevent 700Hz IPC flooding
 - [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded
@@ -132,17 +133,21 @@ This opens an interactive capture mode on `/dev/tty` and logs `PROJCAP` entries 
 `build/Debug/bridge-logs/led.log`. Each capture records:
 
 - logical-slot diffs from the raw `NI_CMD_LED` payload
-- remapped `phys[...]` byte diffs from the outgoing EP1 LED packet
+- remapped `phys[...]` byte diffs from the current Packet B / `second_block` LED path
 
 Recommended workflow:
 
 1. Load a project first and wait for the initial LED baseline.
 2. Use low-fanout controls that should only affect a small, local LED cluster.
-3. Prefer Pad Section buttons such as `Scene`, `Pattern`, `Pad Mode`, `Navigate`,
-   `Duplicate`, `Select`, `Solo`, and `Mute`.
-4. Avoid transport buttons and mode switches known to trigger broad LED refreshes,
+3. Prefer controls that still flow through the captured Packet B path, such as
+   `Group A`-`Group H`, `Auto Write`, `Snap`, `Modules Left`, `Modules Right`,
+   `Sampling`, `Browse`, `Control`, `Step`, `SA1`-`SA8`, and `Note Repeat`.
+4. Do not use scene-row / Packet A controls for project capture right now:
+   `Mute`, `Solo`, `Select`, `Duplicate`, `Navigate`, `Pad Mode`, `Pattern`,
+   `Scene`, `Shift`, `Erase`, `Grid`, `Record`, `Play`, and `TransportRight`.
+5. Avoid transport buttons and mode switches known to trigger broad LED refreshes,
    especially `Play` and `Restart`.
-5. For direct physical probing, `MK1_LED_PROBE=1` now supports `phys[0..32]`.
+6. For direct physical probing, `MK1_LED_PROBE=1` now supports `phys[0..32]`.
 
 The goal is to capture small diffs that isolate a single button LED or a very small
 set of neighboring LEDs. Large transport-state changes make the results harder to

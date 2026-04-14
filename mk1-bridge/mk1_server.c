@@ -742,7 +742,7 @@ static bool push_to_port(mk1_server_t *srv, CFMessagePortRef *target_slot,
     result = CFMessagePortSendRequest(target,
                                       (SInt32)msgid,
                                       payload,
-                                      1.0,      // send timeout
+                                      0.025,    // send timeout — fail fast; drop if queue full
                                       0.0,      // no recv (fire-and-forget)
                                       NULL,
                                       NULL);
@@ -752,7 +752,7 @@ static bool push_to_port(mk1_server_t *srv, CFMessagePortRef *target_slot,
         result = CFMessagePortSendRequest(target,
                                           (SInt32)msgid,
                                           payload,
-                                          1.0,
+                                          0.025,
                                           0.0,
                                           NULL,
                                           NULL);

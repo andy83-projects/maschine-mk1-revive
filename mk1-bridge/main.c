@@ -1100,6 +1100,27 @@ static bool apple_upper_has_non_passthrough_override(const void *entries_void, i
     return false;
 }
 
+static bool suppress_project_dim_cluster_slot(uint8_t logical_idx)
+{
+    // Project captures on Apple Silicon show this low legacy cluster asserting dim
+    // LEDs that do not light on Intel for the same projects. Keep Groups G/H out
+    // of this mask until they are isolated separately.
+    switch (logical_idx) {
+        case 4:
+        case 5:
+        case 8:
+        case 9:
+        case 10:
+        case 11:
+        case 13:
+        case 14:
+        case 15:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void emit_led_state(bridge_t *br, const uint8_t *led_logical, size_t full_len)
 {
     // Base linear remap for selector-6 LEDs.
@@ -1230,6 +1251,14 @@ static void emit_led_state(bridge_t *br, const uint8_t *led_logical, size_t full
         if ((size_t)li >= full_len || led_logical[li] == 0) continue;
 
         uint8_t old_phys = k_hw_by_logical[li];  // li < 32 guaranteed by table
+
+        if (getenv("MK1_SUPPRESS_APPLE_PROJECT_DIM_CLUSTER") &&
+            suppress_project_dim_cluster_slot(li)) {
+            if (old_phys < 32) second_block[old_phys] = 0;
+            LLOG("upper-slot suppressed by MK1_SUPPRESS_APPLE_PROJECT_DIM_CLUSTER: %s logical[%u]=0x%02x cleared phys[%u]",
+                 k_apple_upper[k].name, (unsigned)li, led_logical[li], (unsigned)old_phys);
+            continue;
+        }
 
         if (ov == 0xFF) {
             if (apple_upper_has_non_passthrough_override(k_apple_upper, k_apple_upper_n, li)) {

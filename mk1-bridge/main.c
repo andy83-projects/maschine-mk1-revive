@@ -1198,12 +1198,12 @@ static void on_connect(void *ctx)
 // Filters ADC jitter at 700Hz without suppressing real aftertouch changes.
 // ~5% of full range — coarse enough to avoid flooding, fine enough to feel responsive.
 #define PAD_PRESSURE_THRESHOLD  200
-// Hit-on threshold raised to 512 (~12.5% of 4095) to suppress rubber-matrix crosstalk.
-// At 256 (~6%), pressing any pad hard pushed neighbours above threshold causing rogue hits.
-#define PAD_HIT_ON_THRESHOLD    512
-// Hysteresis: release fires when pressure drops below this. Keep well below hit-on so
-// sustained light aftertouch doesn't flicker, but low enough to register a clean release.
-#define PAD_HIT_OFF_THRESHOLD   200
+// Hit-on threshold (~7.3% of 4095). Raised from original 256 to reduce rubber-matrix
+// crosstalk; debounce handles bounce so this only needs to beat crosstalk levels.
+// Tune up if rogue neighbour-pad hits persist; tune down if light taps don't register.
+#define PAD_HIT_ON_THRESHOLD    300
+// Hysteresis: release fires when pressure drops below this.
+#define PAD_HIT_OFF_THRESHOLD   150
 // Minimum nanoseconds between hit_off and next hit_on for the same pad.
 // Prevents rubber bounce from generating double-triggers on quick successive hits.
 #define PAD_DEBOUNCE_NS  10000000ULL   /* 10 ms — kills rubber bounce (<5ms), safe for 1/32 at 200 BPM */

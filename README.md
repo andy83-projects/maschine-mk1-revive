@@ -132,6 +132,52 @@ For latency instrumentation during testing:
 MK1_TIMING_TRACE=1 ./build/Debug/mk1-bridge --partial_display_max=2048
 ```
 
+## Install
+
+Current release packaging installs:
+
+- the bridge binary to `/usr/local/bin/mk1-bridge`
+- the LaunchAgent plist to `/Library/LaunchAgents/com.dragco.mk1-bridge.plist`
+
+### Unsigned Package Install
+
+The current GitHub package release is unsigned. macOS may warn that the package
+or installed binary is from an unidentified developer.
+
+If the package opens normally, install it and then load the LaunchAgent:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist
+launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
+```
+
+If macOS blocks the package or binary, use one of these paths:
+
+1. In Finder, right-click the `.pkg` and choose `Open`.
+2. If macOS still blocks it, open `System Settings` -> `Privacy & Security` and
+   allow the blocked package or binary to run.
+3. If the installed binary is quarantined, clear quarantine manually and restart
+   the LaunchAgent:
+
+```bash
+sudo xattr -dr com.apple.quarantine /usr/local/bin/mk1-bridge
+launchctl bootout "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist
+launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
+```
+
+### Manual Install
+
+If the unsigned package path is too noisy, manual install is usually the lowest-friction
+option without paying for Apple Developer distribution certificates:
+
+```bash
+sudo install -m 755 ./build/Release/mk1-bridge /usr/local/bin/mk1-bridge
+sudo install -m 644 ./mk1-bridge/com.dragco.mk1-bridge.plist /Library/LaunchAgents/com.dragco.mk1-bridge.plist
+launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist
+launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
+```
+
 ## Status
 
 - [x] Directory structure and project scaffold

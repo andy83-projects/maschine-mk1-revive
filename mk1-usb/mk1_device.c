@@ -66,6 +66,7 @@ struct mk1_device {
 
     mk1_pad_callback_t       pad_cb;
     mk1_button_callback_t    button_cb;
+    mk1_midi_callback_t      midi_cb;
     void                    *cb_context;
     bool                     trace_reports;
     bool                     trace_scan_reports;
@@ -178,6 +179,9 @@ static uint8_t mk1_normalize_led_brightness(uint8_t value);
 static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
                                              const uint8_t *data,
                                              size_t len);
+static void mk1_device_process_ep1_midi_packet(mk1_device_t *dev,
+                                               const uint8_t *data,
+                                               size_t len);
 static bool mk1_verbose_io_enabled(void);
 
 static void trim_trailing_ascii_whitespace(char *text)
@@ -1255,6 +1259,41 @@ static void mk1_device_process_ep1_button_packet(mk1_device_t *dev,
     }
 }
 
+static void mk1_device_process_ep1_midi_packet(mk1_device_t *dev,
+                                               const uint8_t *data,
+                                               size_t len)
+{
+    mk1_midi_event_t event = {0};
+    size_t payload_offset = 1;
+    size_t payload_len = 0;
+
+    if (!dev || !dev->midi_cb || !data || len < 2 || data[0] != 0x06) {
+        return;
+    }
+
+    if (len >= 3) {
+        size_t declared_len = ((size_t)data[1] << 8) | (size_t)data[2];
+        if (declared_len > 0 && declared_len <= len - 3) {
+            payload_offset = 3;
+            payload_len = declared_len;
+        }
+    }
+
+    if (payload_len == 0) {
+        payload_len = len - payload_offset;
+    }
+    if (payload_len == 0) {
+        return;
+    }
+    if (payload_len > sizeof(event.raw)) {
+        payload_len = sizeof(event.raw);
+    }
+
+    event.len = payload_len;
+    memcpy(event.raw, data + payload_offset, payload_len);
+    dev->midi_cb(&event, dev->cb_context);
+}
+
 static bool get_pipe_endpoint_number(const mk1_device_t *dev,
                                      UInt8 pipe_ref,
                                      UInt8 *endpoint_number)
@@ -1314,6 +1353,9 @@ static void mk1_device_handle_ep1_reply(mk1_device_t *dev,
             dev->have_user_data_reply = true;
         }
         USBVLOG("EP1 reply type=0x14 len=%zu (user data)", len);
+        break;
+    case 0x06:
+        USBVLOG("EP1 reply type=0x06 len=%zu (midi in)", len);
         break;
     default:
         USBVLOG("EP1 reply type=0x%02x len=%zu", data[0], len);
@@ -1917,6 +1959,7 @@ static void *read_thread_main(void *context)
         log_all_pipe_report(reader, buffer, size);
         if (reader->endpoint_number == 1) {
             mk1_device_process_ep1_button_packet(dev, reader, buffer, size);
+            mk1_device_process_ep1_midi_packet(dev, buffer, size);
             mk1_device_handle_ep1_reply(dev, buffer, size);
             continue;
         }
@@ -2268,6 +2311,7 @@ bool mk1_device_replay_startup_init(mk1_device_t *dev)
 bool mk1_device_start(mk1_device_t *dev,
                       mk1_pad_callback_t pad_cb,
                       mk1_button_callback_t button_cb,
+                      mk1_midi_callback_t midi_cb,
                       void *context)
 {
     if (!dev || dev->running || !dev->interface || dev->input_pipe_count == 0) {
@@ -2276,6 +2320,7 @@ bool mk1_device_start(mk1_device_t *dev,
 
     dev->pad_cb = pad_cb;
     dev->button_cb = button_cb;
+    dev->midi_cb = midi_cb;
     dev->cb_context = context;
     dev->running = true;
 
@@ -2388,6 +2433,28 @@ bool mk1_set_display(mk1_device_t *dev, uint8_t display_index,
     memcpy(packet + 3, pixels, len);
     return mk1_device_write_endpoint(dev, 0x08, packet, len + 3);
 }
+
+bool mk1_device_write_midi(mk1_device_t *dev,
+                           const uint8_t *data,
+                           size_t len)
+{
+    uint8_t packet[1027];
+
+    if (!dev || !data || len == 0) {
+        return false;
+    }
+    if (len > sizeof(packet) - 3) {
+        fprintf(stderr, "[mk1-usb] mk1_device_write_midi payload too large: %zu bytes\n", len);
+        return false;
+    }
+
+    packet[0] = 0x07;
+    packet[1] = (uint8_t)((len >> 8) & 0xff);
+    packet[2] = (uint8_t)(len & 0xff);
+    memcpy(packet + 3, data, len);
+    return mk1_device_write_endpoint(dev, 0x01, packet, len + 3);
+}
+
 static int32_t mk1_uc_send_ep1_command(mk1_user_client_t *client,
                                        uint8_t command,
                                        const void *payload,
@@ -2621,10 +2688,21 @@ int32_t mk1_user_client_call_method(mk1_user_client_t *client,
     }
     case MK1_UC_SELECTOR_GET_HARDWARE_BUFFER_SIZE:
     case MK1_UC_SELECTOR_SET_HARDWARE_BUFFER_SIZE:
-    case MK1_UC_SELECTOR_MIDI_WRITE:
-    case MK1_UC_SELECTOR_MIDI_WRITE_FAKE:
     case MK1_UC_SELECTOR_DIGITAL_INPUT_ARM:
         return kIOReturnSuccess;
+    case MK1_UC_SELECTOR_MIDI_WRITE:
+    case MK1_UC_SELECTOR_MIDI_WRITE_FAKE: {
+        size_t payload_len = input_struct_count;
+        if ((!input_struct || input_struct_count == 0) && input_scalars && input_scalar_count > 0) {
+            payload_len = (size_t)input_scalars[0];
+        }
+        if (!input_struct || payload_len == 0 || payload_len > input_struct_count) {
+            return kIOReturnBadArgument;
+        }
+        return mk1_device_write_midi(client->device, input_struct, payload_len)
+            ? kIOReturnSuccess
+            : kIOReturnError;
+    }
     case MK1_UC_SELECTOR_SET_THRESHOLDS: {
         size_t payload_len = input_struct_count;
         if ((!input_struct || input_struct_count == 0) && input_scalars && input_scalar_count > 0) {

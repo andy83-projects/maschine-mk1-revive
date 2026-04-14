@@ -39,6 +39,11 @@ typedef struct {
     uint8_t raw[64];    // raw report bytes, parsed later
 } mk1_button_event_t;
 
+typedef struct {
+    size_t  len;
+    uint8_t raw[1024];
+} mk1_midi_event_t;
+
 // Callbacks
 typedef void (*mk1_pad_callback_t)(const mk1_pad_event_t *pads,
                                     uint8_t count,
@@ -46,6 +51,9 @@ typedef void (*mk1_pad_callback_t)(const mk1_pad_event_t *pads,
 
 typedef void (*mk1_button_callback_t)(const mk1_button_event_t *event,
                                        void *context);
+
+typedef void (*mk1_midi_callback_t)(const mk1_midi_event_t *event,
+                                     void *context);
 
 // Lifecycle
 mk1_device_t *mk1_device_open(void);
@@ -73,6 +81,7 @@ void mk1_hotplug_stop(mk1_hotplug_t *hp);
 bool mk1_device_start(mk1_device_t *dev,
                       mk1_pad_callback_t    pad_cb,
                       mk1_button_callback_t button_cb,
+                      mk1_midi_callback_t   midi_cb,
                       void *context);
 
 void mk1_device_stop(mk1_device_t *dev);
@@ -87,6 +96,10 @@ bool mk1_device_write_endpoint(mk1_device_t *dev,
                                uint8_t endpoint_number,
                                const uint8_t *data,
                                size_t len);
+
+bool mk1_device_write_midi(mk1_device_t *dev,
+                           const uint8_t *data,
+                           size_t len);
 
 // Send caiaq protocol init sequence (GET_DEVICE_INFO, AUTO_MSG, DIMM_LEDS, EP8 config).
 // Must be called after mk1_device_open() and before mk1_device_start().

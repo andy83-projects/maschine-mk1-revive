@@ -16,6 +16,7 @@
 #include <spawn.h>
 #include <stdarg.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreMIDI/CoreMIDI.h>
 #include <dispatch/dispatch.h>
 
 #include "mk1_server.h"
@@ -144,6 +145,9 @@ typedef struct {
     mk1_server_t   *srv;
     mk1_device_t   *usb;
     mk1_hotplug_t  *hotplug;
+    MIDIClientRef   midi_client;
+    MIDIEndpointRef midi_source;
+    MIDIEndpointRef midi_destination;
 } bridge_t;
 
 static bridge_t g_bridge;
@@ -154,6 +158,7 @@ static uint8_t g_last_led_logical[128] = {0};
 static size_t g_last_led_logical_len = 0;
 static bool g_guided_mode_only = false;
 static int g_open_retry_budget = 0;
+static bool g_midi_warned_no_usb = false;
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; CFRunLoopStop(CFRunLoopGetMain()); }
 static void maybe_start_guided_mode(bridge_t *br);
@@ -161,6 +166,90 @@ static void schedule_device_open_retry(bridge_t *br);
 static bool guided_verify_with_maschine(void);
 static void emit_led_state(bridge_t *br, const uint8_t *led_logical, size_t full_len);
 static void refresh_led_from_cache(bridge_t *br);
+static bool midi_bridge_start(bridge_t *br);
+static void midi_bridge_stop(bridge_t *br);
+
+static void midi_read_proc(const MIDIPacketList *packet_list,
+                           void *read_proc_ref_con,
+                           void *src_conn_ref_con)
+{
+    bridge_t *br = (bridge_t *)read_proc_ref_con;
+    const MIDIPacket *packet = NULL;
+    (void)src_conn_ref_con;
+
+    if (!br || !packet_list) return;
+
+    if (!br->usb) {
+        if (!g_midi_warned_no_usb) {
+            BLOG("CoreMIDI received data while MK1 USB device is unavailable");
+            g_midi_warned_no_usb = true;
+        }
+        return;
+    }
+
+    packet = &packet_list->packet[0];
+    for (UInt32 i = 0; i < packet_list->numPackets; i++) {
+        if (packet->length > 0) {
+            bool ok = mk1_device_write_midi(br->usb, packet->data, packet->length);
+            if (!ok) {
+                BLOG("CoreMIDI -> DIN write failed for %u-byte packet", (unsigned)packet->length);
+            }
+        }
+        packet = MIDIPacketNext(packet);
+    }
+}
+
+static bool midi_bridge_start(bridge_t *br)
+{
+    OSStatus status = noErr;
+
+    if (!br) return false;
+    if (br->midi_client) return true;
+
+    status = MIDIClientCreate(CFSTR("mk1-bridge"), NULL, NULL, &br->midi_client);
+    if (status != noErr) {
+        BLOG("CoreMIDI client creation failed: %d", (int)status);
+        return false;
+    }
+
+    status = MIDISourceCreate(br->midi_client, CFSTR("Maschine MK1 DIN In"), &br->midi_source);
+    if (status != noErr) {
+        BLOG("CoreMIDI source creation failed: %d", (int)status);
+        midi_bridge_stop(br);
+        return false;
+    }
+
+    status = MIDIDestinationCreate(br->midi_client,
+                                   CFSTR("Maschine MK1 DIN Out"),
+                                   midi_read_proc,
+                                   br,
+                                   &br->midi_destination);
+    if (status != noErr) {
+        BLOG("CoreMIDI destination creation failed: %d", (int)status);
+        midi_bridge_stop(br);
+        return false;
+    }
+
+    BLOG("CoreMIDI ports published: source='Maschine MK1 DIN In' destination='Maschine MK1 DIN Out'");
+    return true;
+}
+
+static void midi_bridge_stop(bridge_t *br)
+{
+    if (!br) return;
+    if (br->midi_destination) {
+        MIDIEndpointDispose(br->midi_destination);
+        br->midi_destination = 0;
+    }
+    if (br->midi_source) {
+        MIDIEndpointDispose(br->midi_source);
+        br->midi_source = 0;
+    }
+    if (br->midi_client) {
+        MIDIClientDispose(br->midi_client);
+        br->midi_client = 0;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Session state — for bridge reconnect while Maschine is running
@@ -1827,6 +1916,34 @@ static void on_button(const mk1_button_event_t *ev, void *ctx)
          (unsigned long long)((timing_now_ns() - start_ns) / 1000ULL));
 }
 
+static void on_midi(const mk1_midi_event_t *ev, void *ctx)
+{
+    bridge_t *br = (bridge_t *)ctx;
+    Byte packet_buffer[1200];
+    MIDIPacketList *packet_list = (MIDIPacketList *)packet_buffer;
+    MIDIPacket *packet = NULL;
+    OSStatus status = noErr;
+
+    if (!br || !ev || ev->len == 0 || !br->midi_source) return;
+
+    packet = MIDIPacketListInit(packet_list);
+    packet = MIDIPacketListAdd(packet_list,
+                               sizeof(packet_buffer),
+                               packet,
+                               0,
+                               (UInt16)ev->len,
+                               ev->raw);
+    if (!packet) {
+        BLOG("DIN MIDI -> CoreMIDI packet too large: %zu bytes", ev->len);
+        return;
+    }
+
+    status = MIDIReceived(br->midi_source, packet_list);
+    if (status != noErr) {
+        BLOG("DIN MIDI -> CoreMIDI delivery failed: %d", (int)status);
+    }
+}
+
 static bool env_truthy(const char *name)
 {
     const char *value = getenv(name);
@@ -2896,7 +3013,9 @@ static bool device_open_and_init(bridge_t *br)
         mk1_device_write_endpoint(br->usb, 0x01, bl, sizeof(bl));
     }
 
-    if (!mk1_device_start(br->usb, on_pad, on_button, br)) {
+    g_midi_warned_no_usb = false;
+
+    if (!mk1_device_start(br->usb, on_pad, on_button, on_midi, br)) {
         BLOG("WARNING: could not start USB read thread after arrival");
     }
 
@@ -2985,6 +3104,7 @@ static void on_device_removed(void *ctx)
     mk1_device_stop(br->usb);
     mk1_device_close(br->usb);
     br->usb = NULL;
+    g_midi_warned_no_usb = false;
 
     // Reset pad state so stale pressure readings don't linger on reconnect.
     memset(g_prev_pressure, 0, sizeof(g_prev_pressure));
@@ -3043,6 +3163,7 @@ int main(int argc, char **argv)
     BLOG("display flush scheduler tick=%d ms", g_display_tick_ms);
     BLOG("display partial flush=%s", g_display_partial_flush ? "enabled" : "disabled");
     BLOG("display partial max payload=%zu", g_display_partial_max_payload);
+    midi_bridge_start(&g_bridge);
 
     if (env_truthy("MK1_LED_PROBE") || (env_truthy("MK1_LED_VERIFY") && !guided_verify_with_maschine())) {
         g_guided_mode_only = true;
@@ -3115,6 +3236,7 @@ int main(int argc, char **argv)
         mk1_device_stop(g_bridge.usb);
         mk1_device_close(g_bridge.usb);
     }
+    midi_bridge_stop(&g_bridge);
 
     maybe_close_maschine();
 

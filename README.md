@@ -39,6 +39,8 @@ Working as of 2026-04-13:
 - Group, transport, and screen buttons registered (EP1 short reports)
 - All 11 encoders forwarded: Volume, Tempo, Swing (Master Section) + 8 screen area encoders
 - USB hot-plug: bridge can start before device is connected; device can be unplugged and re-plugged
+- Physical DIN MIDI Out transport: basic CoreMIDI-to-DIN path working
+- Physical DIN MIDI In transport: not yet hardware-verified
 
 ### Components
 
@@ -79,6 +81,23 @@ This project leans heavily on reverse engineering work by others:
 - **Report ID `0x10`:** Button and encoder state
 - **Report ID `0x20`:** Pad pressure data (sent continuously)
 - **Output reports:** LED states, display content (2x monochrome LCDs)
+
+## DIN MIDI Ports
+
+The MK1 hardware includes physical DIN MIDI In/Out ports, but the Apple Silicon
+bridge does not yet treat them as fully validated standard MIDI ports.
+
+Current status:
+
+- virtual CoreMIDI ports are exposed as `Maschine MK1 DIN In` and `Maschine MK1 DIN Out`
+- DIN MIDI Out has been hardware-verified at a basic level: DAW MIDI clock sent to
+  `Maschine MK1 DIN Out` reached an external device connected to the MK1 physical DIN Out
+- `cabl` strongly suggests outbound DIN MIDI uses a vendor packet beginning with `0x07`
+- inbound DIN MIDI likely arrives on the EP1 path as packet type `0x06`
+- DIN MIDI In has not yet been validated on hardware
+
+DIN MIDI Out is currently the more trustworthy path. DIN MIDI In should still be
+considered experimental until it is tested with a real device driving the MK1 DIN In port.
 
 ## IPC Protocol
 
@@ -139,6 +158,10 @@ Current release packaging installs:
 - the bridge binary to `/usr/local/bin/mk1-bridge`
 - the LaunchAgent plist to `/Library/LaunchAgents/com.dragco.mk1-bridge.plist`
 
+Current release packaging also includes a matching uninstaller package:
+
+- `maschine-mk1-revive-v<version>-macos-uninstaller.pkg`
+
 ### Unsigned Package Install
 
 The current GitHub package release is unsigned. macOS may warn that the package
@@ -178,6 +201,22 @@ launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.p
 launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
 ```
 
+## Uninstall
+
+Preferred path:
+
+- Run the matching uninstaller package:
+  `maschine-mk1-revive-v<version>-macos-uninstaller.pkg`
+
+Manual removal does the same thing explicitly:
+
+```bash
+launchctl bootout "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist 2>/dev/null || true
+sudo rm -f /Library/LaunchAgents/com.dragco.mk1-bridge.plist
+sudo rm -f /usr/local/bin/mk1-bridge
+sudo pkgutil --forget com.dragco.mk1-bridge
+```
+
 ## Status
 
 - [x] Directory structure and project scaffold
@@ -199,6 +238,8 @@ launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
 - [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine can take 5-30 seconds to reconnect; restarting Maschine may be a faster path
 - [ ] First-launch input miss — after a fresh Maschine launch, the first button or pad press is ignored; second press works and lights correctly
 - [ ] Apple Silicon project-load LED anomaly — some projects still assert errant dim group LEDs on load; the non-group dim cluster now has an env-flagged workaround, but remaining group-button behavior still needs to be isolated and fixed cleanly
+- [~] Physical DIN MIDI Out — basic CoreMIDI bridge working and hardware-verified with MIDI clock
+- [ ] Physical DIN MIDI In — packet path guessed from vendor USB traffic but not yet hardware-verified
 - [ ] launchd agent plist
 - [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)
 

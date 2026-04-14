@@ -13,6 +13,7 @@
 		83D596AB2F78EC0D00DA1545 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A62F78EBAD00DA1545 /* IOKit.framework */; };
 		83D596AC2F78EC1500DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
 		83D596BD2F78F3F800DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
+		A7D1A0013B10000100DA1545 /* CoreMIDI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A7D1A0003B10000100DA1545 /* CoreMIDI.framework */; };
 		A1B2C3D42F79000100DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
 		B1C2D3E42F79000200DA1545 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A82F78EBB800DA1545 /* CoreFoundation.framework */; };
 		B1C2D3E52F79000200DA1545 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 83D596A62F78EBAD00DA1545 /* IOKit.framework */; };
@@ -58,6 +59,7 @@
 		83D596A62F78EBAD00DA1545 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		83D596A82F78EBB800DA1545 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		83D596B12F78F34700DA1545 /* mk1-ipc-test */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "mk1-ipc-test"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A7D1A0003B10000100DA1545 /* CoreMIDI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMIDI.framework; path = System/Library/Frameworks/CoreMIDI.framework; sourceTree = SDKROOT; };
 		A1B2C3D52F79000100DA1545 /* mk1-trace */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "mk1-trace"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1C2D3E62F79000200DA1545 /* libmk1-call-logger.dylib */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.dylib"; includeInIndex = 0; path = "libmk1-call-logger.dylib"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -134,6 +136,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				83D596AC2F78EC1500DA1545 /* CoreFoundation.framework in Frameworks */,
+				A7D1A0013B10000100DA1545 /* CoreMIDI.framework in Frameworks */,
 				83D596AB2F78EC0D00DA1545 /* IOKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -218,6 +221,7 @@
 			isa = PBXGroup;
 			children = (
 				83D596A82F78EBB800DA1545 /* CoreFoundation.framework */,
+				A7D1A0003B10000100DA1545 /* CoreMIDI.framework */,
 				83D596A62F78EBAD00DA1545 /* IOKit.framework */,
 			);
 			name = Frameworks;

@@ -1198,11 +1198,19 @@ static void on_connect(void *ctx)
 // Filters ADC jitter at 700Hz without suppressing real aftertouch changes.
 // ~5% of full range — coarse enough to avoid flooding, fine enough to feel responsive.
 #define PAD_PRESSURE_THRESHOLD  200
-#define PAD_HIT_ON_THRESHOLD    256
-#define PAD_HIT_OFF_THRESHOLD    96
+// Hit-on threshold raised to 512 (~12.5% of 4095) to suppress rubber-matrix crosstalk.
+// At 256 (~6%), pressing any pad hard pushed neighbours above threshold causing rogue hits.
+#define PAD_HIT_ON_THRESHOLD    512
+// Hysteresis: release fires when pressure drops below this. Keep well below hit-on so
+// sustained light aftertouch doesn't flicker, but low enough to register a clean release.
+#define PAD_HIT_OFF_THRESHOLD   200
+// Minimum nanoseconds between hit_off and next hit_on for the same pad.
+// Prevents rubber bounce from generating double-triggers on quick successive hits.
+#define PAD_DEBOUNCE_NS  10000000ULL   /* 10 ms — kills rubber bounce (<5ms), safe for 1/32 at 200 BPM */
 
 static uint16_t g_prev_pressure[16]      = {0};  // for hit_on/hit_off transitions
 static uint16_t g_sent_pressure[16]      = {0};  // last pressure value forwarded via IPC
+static uint64_t g_hit_off_time_ns[16]    = {0};  // timestamp of last hit_off per pad
 
 static void send_pad_record(mk1_server_t *srv,
                              uint64_t ts_ns,
@@ -1250,6 +1258,12 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
         float value = is_active ? (pressure / PAD_PRESSURE_MAX) : 0.0f;
 
         if (!was_active && is_active) {
+            // Debounce: suppress hit_on if we just released this pad within the window.
+            if (ts_ns - g_hit_off_time_ns[idx] < PAD_DEBOUNCE_NS) {
+                g_prev_pressure[idx] = pressure;
+                g_led_pad_pressure[idx] = pressure;
+                continue;
+            }
             // pad struck — send hit_on then initial pressure_update
             BTNLOG("pad idx=%u hit_on pressure=%u (%.3f)", idx, pressure, (double)value);
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON,         value);
@@ -1260,6 +1274,7 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
             BTNLOG("pad idx=%u hit_off", idx);
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_OFF, 0.0f);
             g_sent_pressure[idx] = 0;
+            g_hit_off_time_ns[idx] = ts_ns;
         } else if (is_active) {
             // pad held — only forward if pressure changed enough to be meaningful
             uint16_t sent = g_sent_pressure[idx];

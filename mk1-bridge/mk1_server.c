@@ -988,6 +988,11 @@ bool mk1_server_is_connected(const mk1_server_t *srv)
     return srv && (srv->dev_connected || srv->inst_connected);
 }
 
+bool mk1_server_is_input_ready(const mk1_server_t *srv)
+{
+    return srv && srv->inst_connected;
+}
+
 // ---------------------------------------------------------------------------
 // Public: get Maschine's instance notification port name (for reconnect)
 // ---------------------------------------------------------------------------

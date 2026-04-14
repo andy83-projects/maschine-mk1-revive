@@ -117,7 +117,8 @@ The `mk1-shim` target builds independently.
 - [x] Master Section knobs — Volume, Tempo, Swing encoder events forwarded via IPC
 - [x] Screen area encoders — all 8 encoders mapped (byte pairs confirmed from hardware capture)
 - [x] USB hot-plug — bridge survives device unplug/replug; starts before device is connected
-- [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine takes ~30s to reconnect; restart Maschine manually for instant recovery
+- [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine can take 5-30 seconds to reconnect; restarting Maschine may be a faster path
+- [ ] First-launch input miss — after a fresh Maschine launch, the first button or pad press is ignored; second press works and lights correctly
 - [ ] launchd agent plist
 - [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)
 

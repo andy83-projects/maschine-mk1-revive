@@ -244,28 +244,6 @@ static bool get_device_identity(io_service_t service,
     return have_vendor && have_product;
 }
 
-static void copy_service_class_name(io_service_t service, char *dst, size_t dst_size)
-{
-    io_name_t class_name = {0};
-
-    if (!dst || dst_size == 0) return;
-    dst[0] = '\0';
-    if (IOObjectGetClass(service, class_name) == kIOReturnSuccess) {
-        strlcpy(dst, class_name, dst_size);
-    }
-}
-
-static void copy_service_name(io_service_t service, char *dst, size_t dst_size)
-{
-    io_name_t name = {0};
-
-    if (!dst || dst_size == 0) return;
-    dst[0] = '\0';
-    if (IORegistryEntryGetName(service, name) == kIOReturnSuccess) {
-        strlcpy(dst, name, dst_size);
-    }
-}
-
 static void log_service_path(io_service_t service, const char *plane, const char *label)
 {
     io_string_t path = {0};

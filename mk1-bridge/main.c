@@ -350,22 +350,151 @@ static const mk1_glyph_t g_font[128] = {
     [' '] = {{0x00,0x00,0x00,0x00,0x00,0x00,0x00}},
     ['M'] = {{0x11,0x1B,0x15,0x11,0x11,0x11,0x11}},
     ['O'] = {{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}},
+    ['S'] = {{0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}},
     ['a'] = {{0x00,0x0E,0x01,0x0F,0x11,0x11,0x0E}},
     ['c'] = {{0x00,0x0E,0x11,0x10,0x10,0x11,0x0E}},
     ['e'] = {{0x00,0x0E,0x11,0x1F,0x10,0x0F,0x00}},
+    ['f'] = {{0x06,0x09,0x08,0x1C,0x08,0x08,0x08}},
     ['h'] = {{0x10,0x10,0x16,0x19,0x11,0x11,0x11}},
     ['i'] = {{0x04,0x00,0x0C,0x04,0x04,0x04,0x0E}},
     ['n'] = {{0x00,0x1C,0x12,0x11,0x11,0x11,0x00}},
+    ['o'] = {{0x00,0x00,0x0E,0x11,0x11,0x11,0x0E}},
     ['p'] = {{0x1E,0x11,0x11,0x1E,0x10,0x10,0x00}},
+    ['r'] = {{0x00,0x16,0x19,0x10,0x10,0x10,0x00}},
     ['s'] = {{0x00,0x0E,0x10,0x0E,0x01,0x11,0x0E}},
+    ['t'] = {{0x08,0x08,0x1C,0x08,0x08,0x09,0x06}},
+    ['w'] = {{0x00,0x00,0x11,0x11,0x15,0x15,0x0A}},
 };
 
+static inline void bmp_fill(uint8_t bmp[64][255], uint8_t v)
+{
+    memset(bmp, v, 64 * 255);
+}
+
+static inline void bmp_plot(uint8_t bmp[64][255], int x, int y, uint8_t v)
+{
+    if (x < 0 || x >= 255 || y < 0 || y >= 64) return;
+    bmp[y][x] = v;
+}
+
+static void bmp_fill_rect(uint8_t bmp[64][255],
+                          int x0,
+                          int y0,
+                          int x1,
+                          int y1,
+                          uint8_t v)
+{
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+    if (x1 < 0 || y1 < 0 || x0 >= 255 || y0 >= 64) return;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > 254) x1 = 254;
+    if (y1 > 63) y1 = 63;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) bmp[y][x] = v;
+    }
+}
+
+static void bmp_fill_ellipse(uint8_t bmp[64][255],
+                             int cx,
+                             int cy,
+                             int rx,
+                             int ry,
+                             uint8_t v)
+{
+    if (rx <= 0 || ry <= 0) return;
+    for (int y = cy - ry; y <= cy + ry; y++) {
+        for (int x = cx - rx; x <= cx + rx; x++) {
+            long dx = x - cx;
+            long dy = y - cy;
+            long lhs = dx * dx * ry * ry + dy * dy * rx * rx;
+            long rhs = (long)rx * rx * ry * ry;
+            if (lhs <= rhs) bmp_plot(bmp, x, y, v);
+        }
+    }
+}
+
+static void bmp_fill_triangle(uint8_t bmp[64][255],
+                              int x1,
+                              int y1,
+                              int x2,
+                              int y2,
+                              int x3,
+                              int y3,
+                              uint8_t v)
+{
+    int min_x = x1, max_x = x1, min_y = y1, max_y = y1;
+    if (x2 < min_x) min_x = x2;
+    if (x3 < min_x) min_x = x3;
+    if (x2 > max_x) max_x = x2;
+    if (x3 > max_x) max_x = x3;
+    if (y2 < min_y) min_y = y2;
+    if (y3 < min_y) min_y = y3;
+    if (y2 > max_y) max_y = y2;
+    if (y3 > max_y) max_y = y3;
+
+    for (int y = min_y; y <= max_y; y++) {
+        for (int x = min_x; x <= max_x; x++) {
+            int w1 = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1);
+            int w2 = (x3 - x2) * (y - y2) - (y3 - y2) * (x - x2);
+            int w3 = (x1 - x3) * (y - y3) - (y1 - y3) * (x - x3);
+            bool has_neg = (w1 < 0) || (w2 < 0) || (w3 < 0);
+            bool has_pos = (w1 > 0) || (w2 > 0) || (w3 > 0);
+            if (!(has_neg && has_pos)) bmp_plot(bmp, x, y, v);
+        }
+    }
+}
+
+static void bmp_pack_st7529(uint8_t *fb, uint8_t bmp[64][255])
+{
+    for (int y = 0; y < 64; y++) {
+        uint8_t *row = fb + y * DISPLAY_BYTES_PER_ROW;
+        for (int gr = 0; gr < 85; gr++) {
+            uint8_t a = bmp[y][gr * 3];
+            uint8_t b = bmp[y][gr * 3 + 1];
+            uint8_t c = bmp[y][gr * 3 + 2];
+            row[gr * 2]     = (a << 3) | (b >> 2);
+            row[gr * 2 + 1] = (uint8_t)((b << 6) | c);
+        }
+    }
+}
+
+static void render_cat_status_fb(uint8_t *fb)
+{
+    static uint8_t bmp[64][255];
+    const uint8_t white = 0x1F;
+    const uint8_t black = 0x00;
+
+    bmp_fill(bmp, white);
+
+    // Simple centered cat silhouette with upright tail.
+    bmp_fill_ellipse(bmp, 122, 37, 40, 13, black);    // body
+    bmp_fill_ellipse(bmp, 85, 25, 12, 10, black);     // head
+    bmp_fill_triangle(bmp, 77, 18, 82, 7, 87, 18, black); // left ear
+    bmp_fill_triangle(bmp, 84, 18, 89, 6, 95, 19, black); // right ear
+    bmp_fill_rect(bmp, 98, 42, 105, 57, black);       // front leg
+    bmp_fill_rect(bmp, 114, 42, 121, 57, black);      // front leg
+    bmp_fill_rect(bmp, 133, 43, 140, 57, black);      // rear leg
+    bmp_fill_rect(bmp, 147, 42, 154, 57, black);      // rear leg
+    bmp_fill_ellipse(bmp, 83, 34, 8, 4, white);       // neck cut-in
+    bmp_fill_ellipse(bmp, 161, 22, 5, 18, black);     // tail upright
+    bmp_fill_ellipse(bmp, 155, 9, 8, 5, black);       // tail curl tip
+    bmp_fill_ellipse(bmp, 157, 29, 5, 7, black);      // tail base
+    bmp_fill_rect(bmp, 70, 57, 160, 59, black);       // ground shadow line
+
+    bmp_pack_st7529(fb, bmp);
+}
+
 // Render up to two lines of text into the 10880-byte ST7529 framebuffer.
-static void render_status_fb(uint8_t *fb, const char *line1, const char *line2)
+static void render_status_fb(uint8_t *fb,
+                             const char *line1,
+                             const char *line2,
+                             bool invert)
 {
     // Work in 255×64 logical pixel space (one byte per pixel, 5-bit value 0x00/0x1F).
     static uint8_t bmp[64][255];
-    memset(bmp, 0, sizeof(bmp));
+    memset(bmp, invert ? 0x1F : 0x00, sizeof(bmp));
 
     const char *lines[2] = { line1, line2 };
     int line_h  = GLYPH_H * STATUS_SCALE;   // 21
@@ -389,7 +518,7 @@ static void render_status_fb(uint8_t *fb, const char *line1, const char *line2)
             for (int row = 0; row < GLYPH_H; row++) {
                 for (int col = 0; col < GLYPH_W; col++) {
                     uint8_t on = (g->r[row] >> (4 - col)) & 1;
-                    uint8_t v  = on ? 0x1F : 0x00;
+                    uint8_t v  = on ? (invert ? 0x00 : 0x1F) : (invert ? 0x1F : 0x00);
                     for (int sy = 0; sy < STATUS_SCALE; sy++) {
                         int py = cy + row * STATUS_SCALE + sy;
                         if (py < 0 || py >= 64) continue;
@@ -404,17 +533,7 @@ static void render_status_fb(uint8_t *fb, const char *line1, const char *line2)
         }
     }
 
-    // Pack 255-wide 5-bit bitmap → 170-byte ST7529 rows (3 px → 2 bytes).
-    for (int y = 0; y < 64; y++) {
-        uint8_t *row = fb + y * DISPLAY_BYTES_PER_ROW;
-        for (int gr = 0; gr < 85; gr++) {
-            uint8_t a = bmp[y][gr * 3];
-            uint8_t b = bmp[y][gr * 3 + 1];
-            uint8_t c = bmp[y][gr * 3 + 2];
-            row[gr * 2]     = (a << 3) | (b >> 2);
-            row[gr * 2 + 1] = (uint8_t)((b << 6) | c);
-        }
-    }
+    bmp_pack_st7529(fb, bmp);
 }
 
 // Send a pre-rendered framebuffer to one display (EP8).
@@ -441,14 +560,18 @@ static void send_fb_to_display(bridge_t *br, uint8_t usb_base, const uint8_t *fb
     free(frame);
 }
 
-// Render and send "Open Maschine" to both displays.
+// Render and send the disconnected status screens.
 static void show_status_screen(bridge_t *br)
 {
     if (!br->usb) return;
-    uint8_t fb[DISPLAY_FB_BYTES];
-    render_status_fb(fb, "Open", "Maschine");
-    send_fb_to_display(br, 0x00, fb);
-    send_fb_to_display(br, 0x02, fb);
+    uint8_t left_fb[DISPLAY_FB_BYTES];
+    uint8_t right_fb[DISPLAY_FB_BYTES];
+
+    render_cat_status_fb(left_fb);
+    render_status_fb(right_fb, "Open Maschine", "Software", true);
+
+    send_fb_to_display(br, 0x00, left_fb);
+    send_fb_to_display(br, 0x02, right_fb);
     DLOG("status screen shown");
 }
 
@@ -1239,7 +1362,7 @@ static void send_pad_record(mk1_server_t *srv,
 static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
 {
     bridge_t *br = (bridge_t *)ctx;
-    if (!br->srv || !mk1_server_is_connected(br->srv)) return;
+    if (!br->srv || !mk1_server_is_input_ready(br->srv)) return;
 
     struct timespec ts;
     clock_gettime(CLOCK_UPTIME_RAW, &ts);
@@ -1295,7 +1418,7 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
 static void on_button(const mk1_button_event_t *ev, void *ctx)
 {
     bridge_t *br = (bridge_t *)ctx;
-    if (!br->srv || !mk1_server_is_connected(br->srv)) return;
+    if (!br->srv || !mk1_server_is_input_ready(br->srv)) return;
 
     uint32_t msg_type = 0;
     if (ev->len >= 4) memcpy(&msg_type, ev->raw, 4);

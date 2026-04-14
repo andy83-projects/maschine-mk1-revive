@@ -10,10 +10,13 @@ BUILD_DIR="${REPO_ROOT}/build/${CONFIGURATION}"
 OUT_DIR="${REPO_ROOT}/dist"
 
 PKG_NAME="maschine-mk1-revive-v${VERSION}-macos.pkg"
+UNINSTALLER_PKG_NAME="maschine-mk1-revive-v${VERSION}-macos-uninstaller.pkg"
 ZIP_NAME="maschine-mk1-revive-v${VERSION}-manual-install.zip"
 
 PKG_SOURCE="${OUT_DIR}/mk1-bridge-${VERSION}-${CONFIGURATION}.pkg"
+UNINSTALLER_PKG_SOURCE="${OUT_DIR}/mk1-bridge-uninstaller-${VERSION}.pkg"
 PKG_DEST="${OUT_DIR}/${PKG_NAME}"
+UNINSTALLER_PKG_DEST="${OUT_DIR}/${UNINSTALLER_PKG_NAME}"
 ZIP_DEST="${OUT_DIR}/${ZIP_NAME}"
 
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mk1-bridge-release-assets.XXXXXX")"
@@ -21,9 +24,11 @@ ZIP_ROOT="${STAGE_DIR}/maschine-mk1-revive-v${VERSION}"
 trap 'rm -rf "${STAGE_DIR}"' EXIT INT TERM
 
 PKG_VERSION="${VERSION}" CONFIGURATION="${CONFIGURATION}" sh "${SCRIPT_DIR}/build-installer-pkg.sh"
+PKG_VERSION="${VERSION}" sh "${SCRIPT_DIR}/build-uninstaller-pkg.sh"
 
 mkdir -p "${OUT_DIR}"
 cp "${PKG_SOURCE}" "${PKG_DEST}"
+cp "${UNINSTALLER_PKG_SOURCE}" "${UNINSTALLER_PKG_DEST}"
 
 mkdir -p "${ZIP_ROOT}"
 install -m 755 "${BUILD_DIR}/mk1-bridge" "${ZIP_ROOT}/mk1-bridge"
@@ -38,4 +43,5 @@ rm -f "${ZIP_DEST}"
 
 printf 'Built release assets:\n'
 printf '  %s\n' "${PKG_DEST}"
+printf '  %s\n' "${UNINSTALLER_PKG_DEST}"
 printf '  %s\n' "${ZIP_DEST}"

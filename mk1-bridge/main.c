@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <limits.h>
 #include <time.h>
 #include <pthread.h>
 #include <spawn.h>
@@ -19,6 +20,7 @@
 #include <CoreMIDI/CoreMIDI.h>
 #include <dispatch/dispatch.h>
 
+#include "bridge.h"
 #include "mk1_server.h"
 #include "../mk1-usb/mk1_device.h"
 #include "../mk1-ipc/mk1_ipc.h"
@@ -28,7 +30,9 @@ extern char **environ;
 // ---------------------------------------------------------------------------
 // Logging
 //
-// Four log files written to ~/Library/Logs/mk1-bridge/:
+// Category log files written to /tmp/maschine-mk1-revive/.
+// Each file is capped at 10 MiB. Once the next write would exceed that size,
+// the file is truncated and logging starts over from the beginning.
 //   bridge.log  — startup, USB, IPC, errors
 //   led.log     — every LED IPC command and EP1 output
 //   display.log — every display IPC command
@@ -37,12 +41,19 @@ extern char **environ;
 // Each category also writes to stderr for live terminal monitoring.
 // ---------------------------------------------------------------------------
 
-static FILE *g_log_bridge  = NULL;
-static FILE *g_log_led     = NULL;
-static FILE *g_log_display = NULL;
-static FILE *g_log_buttons = NULL;
-static FILE *g_log_encoder = NULL;
-static FILE *g_log_timing  = NULL;
+typedef struct {
+    FILE *fp;
+    char path[PATH_MAX];
+} log_file_t;
+
+#define LOG_FILE_MAX_BYTES (10 * 1024 * 1024)
+
+static log_file_t g_log_bridge  = {0};
+static log_file_t g_log_led     = {0};
+static log_file_t g_log_display = {0};
+static log_file_t g_log_buttons = {0};
+static log_file_t g_log_encoder = {0};
+static log_file_t g_log_timing  = {0};
 
 // When g_quiet is set, only bridge-status messages stay on stderr so the
 // terminal remains usable for interactive prompts. Category logs still go to
@@ -52,19 +63,98 @@ static bool g_timing_trace = false;
 static pid_t g_spawned_maschine_pid = -1;
 static bool g_aux_mode_started = false;
 
-#define LOG(fp, fmt, ...) do { \
-    if (!g_quiet) fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
-    if (fp) { fprintf(fp, fmt "\n", ##__VA_ARGS__); fflush(fp); } \
-} while (0)
+static void close_log_file(log_file_t *log)
+{
+    if (!log) return;
+    if (log->fp) {
+        fclose(log->fp);
+        log->fp = NULL;
+    }
+}
 
-#define BLOG(fmt, ...) do { \
-    fprintf(stderr, "[bridge]  " fmt "\n", ##__VA_ARGS__); \
-    if (g_log_bridge) { fprintf(g_log_bridge, "[bridge]  " fmt "\n", ##__VA_ARGS__); fflush(g_log_bridge); } \
-} while (0)
-#define LLOG(fmt, ...)   LOG(g_log_led,     "[led]     " fmt, ##__VA_ARGS__)
-#define DLOG(fmt, ...)   LOG(g_log_display, "[display] " fmt, ##__VA_ARGS__)
-#define BTNLOG(fmt, ...) LOG(g_log_buttons, "[buttons] " fmt, ##__VA_ARGS__)
-#define ENCLOG(fmt, ...) LOG(g_log_encoder, "[encoder] " fmt, ##__VA_ARGS__)
+static void ensure_log_capacity(log_file_t *log, size_t incoming_bytes)
+{
+    off_t current_size = 0;
+
+    if (!log || !log->path[0]) return;
+    if (!log->fp) {
+        log->fp = fopen(log->path, "a");
+        if (!log->fp) return;
+    }
+
+    current_size = ftello(log->fp);
+    if (current_size < 0) {
+        struct stat st;
+        if (stat(log->path, &st) == 0) {
+            current_size = st.st_size;
+        } else {
+            current_size = 0;
+        }
+    }
+
+    if ((uint64_t)current_size + (uint64_t)incoming_bytes <= (uint64_t)LOG_FILE_MAX_BYTES) {
+        return;
+    }
+
+    fclose(log->fp);
+    log->fp = fopen(log->path, "w");
+    if (log->fp) {
+        static const char wrap_marker[] = "--- mk1-bridge log wrapped at 10 MiB ---\n";
+        fwrite(wrap_marker, 1, sizeof(wrap_marker) - 1, log->fp);
+        fflush(log->fp);
+    }
+}
+
+static void vlog_write(log_file_t *log, bool to_stderr, const char *fmt, va_list args)
+{
+    va_list measure_args;
+    va_list render_args;
+    int needed = 0;
+    char stack_buf[1024];
+    char *line = stack_buf;
+
+    (void)to_stderr;
+
+    va_copy(measure_args, args);
+    needed = vsnprintf(NULL, 0, fmt, measure_args);
+    va_end(measure_args);
+    if (needed < 0) return;
+
+    if ((size_t)needed + 1 > sizeof(stack_buf)) {
+        line = malloc((size_t)needed + 1);
+        if (!line) return;
+    }
+
+    va_copy(render_args, args);
+    vsnprintf(line, (size_t)needed + 1, fmt, render_args);
+    va_end(render_args);
+
+    if (log && log->path[0]) {
+        ensure_log_capacity(log, (size_t)needed + 1);
+        if (log->fp) {
+            fwrite(line, 1, (size_t)needed, log->fp);
+            fputc('\n', log->fp);
+            fflush(log->fp);
+        }
+    }
+
+    if (line != stack_buf) free(line);
+}
+
+static void log_write(log_file_t *log, bool to_stderr, const char *fmt, ...)
+{
+    va_list args;
+
+    va_start(args, fmt);
+    vlog_write(log, to_stderr, fmt, args);
+    va_end(args);
+}
+
+#define BLOG(fmt, ...)   log_write(&g_log_bridge,  true,     "[bridge]  " fmt, ##__VA_ARGS__)
+#define LLOG(fmt, ...)   log_write(&g_log_led,     !g_quiet, "[led]     " fmt, ##__VA_ARGS__)
+#define DLOG(fmt, ...)   log_write(&g_log_display, !g_quiet, "[display] " fmt, ##__VA_ARGS__)
+#define BTNLOG(fmt, ...) log_write(&g_log_buttons, !g_quiet, "[buttons] " fmt, ##__VA_ARGS__)
+#define ENCLOG(fmt, ...) log_write(&g_log_encoder, !g_quiet, "[encoder] " fmt, ##__VA_ARGS__)
 
 static uint64_t timing_now_ns(void)
 {
@@ -80,61 +170,72 @@ static void TLOG(const char *fmt, ...)
     if (!g_timing_trace) return;
 
     va_start(args, fmt);
-    fprintf(stderr, "[timing]  ");
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    va_end(args);
+    {
+        va_list render_args;
+        int needed = 0;
+        char stack_buf[1024];
+        char *line = stack_buf;
 
-    if (g_log_timing) {
-        va_start(args, fmt);
-        fprintf(g_log_timing, "[timing]  ");
-        vfprintf(g_log_timing, fmt, args);
-        fprintf(g_log_timing, "\n");
-        fflush(g_log_timing);
-        va_end(args);
+        va_copy(render_args, args);
+        needed = vsnprintf(NULL, 0, fmt, render_args);
+        va_end(render_args);
+        if (needed >= 0) {
+            if ((size_t)needed + 1 > sizeof(stack_buf)) {
+                line = malloc((size_t)needed + 1);
+            }
+            if (line) {
+                va_copy(render_args, args);
+                vsnprintf(line, (size_t)needed + 1, fmt, render_args);
+                va_end(render_args);
+                log_write(&g_log_timing, true, "[timing]  %s", line);
+                if (line != stack_buf) free(line);
+            }
+        }
     }
+    va_end(args);
 }
 
 static void open_logs(void)
 {
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-
     char dir[512];
-    snprintf(dir, sizeof(dir), "%s/Documents/GitRepos/maschine-mk1-revive/build/Debug/bridge-logs", home);
+    snprintf(dir, sizeof(dir), "%s", "/tmp/maschine-mk1-revive");
     mkdir(dir, 0755);   // no-op if already exists
 
-    char path[600];
+    snprintf(g_log_bridge.path, sizeof(g_log_bridge.path), "%s/%s", dir, "bridge.log");
+    snprintf(g_log_led.path, sizeof(g_log_led.path), "%s/%s", dir, "led.log");
+    snprintf(g_log_display.path, sizeof(g_log_display.path), "%s/%s", dir, "display.log");
+    snprintf(g_log_buttons.path, sizeof(g_log_buttons.path), "%s/%s", dir, "buttons.log");
+    snprintf(g_log_encoder.path, sizeof(g_log_encoder.path), "%s/%s", dir, "encoder.log");
+    snprintf(g_log_timing.path, sizeof(g_log_timing.path), "%s/%s", dir, "timing.log");
 
-#define OPEN_LOG(var, name) \
-    snprintf(path, sizeof(path), "%s/" name, dir); \
-    var = fopen(path, "a"); \
-    if (var) { fprintf(var, "\n--- mk1-bridge started ---\n"); fflush(var); } \
-    fprintf(stderr, "[bridge] log: %s\n", path);
+    mk1_bridge_logf("[bridge] log: %s\n", g_log_bridge.path);
+    mk1_bridge_logf("[bridge] log: %s\n", g_log_led.path);
+    mk1_bridge_logf("[bridge] log: %s\n", g_log_display.path);
+    mk1_bridge_logf("[bridge] log: %s\n", g_log_buttons.path);
+    mk1_bridge_logf("[bridge] log: %s\n", g_log_encoder.path);
+    mk1_bridge_logf("[bridge] log: %s\n", g_log_timing.path);
 
-    OPEN_LOG(g_log_bridge,  "bridge.log")
-    OPEN_LOG(g_log_led,     "led.log")
-    OPEN_LOG(g_log_display, "display.log")
-    OPEN_LOG(g_log_buttons, "buttons.log")
-    OPEN_LOG(g_log_encoder, "encoder.log")
-    OPEN_LOG(g_log_timing,  "timing.log")
+    log_write(&g_log_bridge, false, "--- mk1-bridge started ---");
+    log_write(&g_log_led, false, "--- mk1-bridge started ---");
+    log_write(&g_log_display, false, "--- mk1-bridge started ---");
+    log_write(&g_log_buttons, false, "--- mk1-bridge started ---");
+    log_write(&g_log_encoder, false, "--- mk1-bridge started ---");
+    log_write(&g_log_timing, false, "--- mk1-bridge started ---");
 
-#undef OPEN_LOG
-
-    mk1_device_set_encoder_log(g_log_encoder);
-    mk1_device_set_timing_log(g_log_timing);
+    mk1_device_set_encoder_log_path(g_log_encoder.path);
+    mk1_device_set_timing_log_path(g_log_timing.path);
 }
 
 static void close_logs(void)
 {
-    mk1_device_set_timing_log(NULL);
-    if (g_log_bridge)  { fclose(g_log_bridge);  g_log_bridge  = NULL; }
-    if (g_log_led)     { fclose(g_log_led);     g_log_led     = NULL; }
-    if (g_log_display) { fclose(g_log_display); g_log_display = NULL; }
-    if (g_log_buttons) { fclose(g_log_buttons); g_log_buttons = NULL; }
-    if (g_log_encoder) { fclose(g_log_encoder); g_log_encoder = NULL; }
-    if (g_log_timing)  { fclose(g_log_timing);  g_log_timing  = NULL; }
-    mk1_device_set_encoder_log(NULL);
+    mk1_device_set_timing_log_path(NULL);
+    close_log_file(&g_log_bridge);
+    close_log_file(&g_log_led);
+    close_log_file(&g_log_display);
+    close_log_file(&g_log_buttons);
+    close_log_file(&g_log_encoder);
+    close_log_file(&g_log_timing);
+    mk1_device_set_encoder_log_path(NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -1983,9 +2084,8 @@ static bool parse_int_arg(const char *arg, const char *prefix, int *out_value)
 
 static void print_usage(const char *prog)
 {
-    fprintf(stderr,
-            "Usage: %s [--partial_display_max=N] [--display_tick_ms=N] [--no-partial-display]\n",
-            prog ? prog : "mk1-bridge");
+    printf("Usage: %s [--partial_display_max=N] [--display_tick_ms=N] [--no-partial-display]\n",
+           prog ? prog : "mk1-bridge");
 }
 
 static const char *maschine_exec_path(void)
@@ -2746,11 +2846,10 @@ static void run_led_probe(mk1_device_t *dev)
         mk1_device_write_endpoint(dev, 0x01, packet, packet_len);
         if (interactive) {
             char note[256];
-            fprintf(stderr,
-                    "\n[probe] slot %d (offset=0x%02x) active. Type what lit up, then press Enter\n"
-                    "[probe] example: Scene | Mute | none\n> ",
-                    idx, (unsigned)probe_offset);
-            fflush(stderr);
+            printf("\n[probe] slot %d (offset=0x%02x) active. Type what lit up, then press Enter\n"
+                   "[probe] example: Scene | Mute | none\n> ",
+                   idx, (unsigned)probe_offset);
+            fflush(stdout);
             if (fgets(note, sizeof(note), stdin)) {
                 size_t len = strlen(note);
                 while (len > 0 && (note[len - 1] == '\n' || note[len - 1] == '\r')) {
@@ -3147,7 +3246,7 @@ int main(int argc, char **argv)
             continue;
         }
 
-        fprintf(stderr, "[bridge]  unknown argument: %s\n", argv[i]);
+        BLOG("unknown argument: %s", argv[i]);
         print_usage(argv[0]);
         return 1;
     }

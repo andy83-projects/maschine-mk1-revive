@@ -41,6 +41,8 @@ Working as of 2026-04-16:
 - USB hot-plug: bridge can start before device is connected; device can be unplugged and re-plugged
 - Physical DIN MIDI Out transport: basic CoreMIDI-to-DIN path working
 - Physical DIN MIDI In transport: not yet hardware-verified
+- Menu Bar applet to control service - Start, Stop, Restart
+- Applet to control user parameters
 
 ### Components
 
@@ -274,9 +276,10 @@ sudo pkgutil --forget com.dragco.mk1-bridge
 - [x] USB hot-plug — bridge survives device unplug/replug; starts before device is connected
 - [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine can take 5-30 seconds to reconnect
 - [ ] First-launch input miss — after a fresh Maschine launch, the first button or pad press is ignored
-- [ ] Apple Silicon project-load LED anomaly — some projects still assert errant dim group LEDs on load
-- [~] Physical DIN MIDI Out — basic CoreMIDI bridge working and hardware-verified with MIDI clock
+- [~ ] Apple Silicon project-load LED anomaly — some projects still assert errant dim group LEDs on load
+- [x] Physical DIN MIDI Out — basic CoreMIDI bridge working and hardware-verified with MIDI clock
 - [ ] Physical DIN MIDI In — packet path guessed from vendor USB traffic but not yet hardware-verified
+- [x] Menubar applet
 
 ## LED Mapping Workflow
 

@@ -21,12 +21,6 @@
     <key>KeepAlive</key>
     <true/>
 
-    <!-- Log output -->
-    <key>StandardOutPath</key>
-    <string>/tmp/mk1-bridge.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/mk1-bridge.log</string>
-
     <!--
         IMPORTANT: We need to start AFTER NIHardwareAgent is running
         but BEFORE Maschine.app opens — so that we can:

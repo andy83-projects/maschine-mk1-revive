@@ -86,10 +86,10 @@ bool mk1_device_start(mk1_device_t *dev,
 
 void mk1_device_stop(mk1_device_t *dev);
 
-// Set log file for encoder/knob diagnostics (len33 changed-byte dumps).
-// Pass NULL to disable. Called from main.c after opening log files.
-void mk1_device_set_encoder_log(FILE *fp);
-void mk1_device_set_timing_log(FILE *fp);
+// Set log path for encoder/knob diagnostics and timing traces.
+// Pass NULL to disable. Called from main.c after configuring log files.
+void mk1_device_set_encoder_log_path(const char *path);
+void mk1_device_set_timing_log_path(const char *path);
 
 // Output
 bool mk1_device_write_endpoint(mk1_device_t *dev,

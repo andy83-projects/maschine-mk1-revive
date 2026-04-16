@@ -8,11 +8,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdarg.h>
 
+#include "../mk1-bridge/bridge.h"
 #include "../mk1-ipc/mk1_ipc.h"
+
+#define fprintf  mk1_bridge_fprintf
+#define vfprintf mk1_bridge_vfprintf
 
 #define MK1_INTERFACE_NUMBER    0
 #define MK1_ALTERNATE_SETTING   1
@@ -117,11 +122,80 @@ struct mk1_user_client {
     mk1_uc_async_registration_t    encoder_read;
 };
 
-static FILE *g_encoder_log = NULL;
-static FILE *g_timing_log = NULL;
+static char g_encoder_log_path[PATH_MAX] = {0};
+static char g_timing_log_path[PATH_MAX] = {0};
 
-void mk1_device_set_encoder_log(FILE *fp) { g_encoder_log = fp; }
-void mk1_device_set_timing_log(FILE *fp) { g_timing_log = fp; }
+#define MK1_LOG_FILE_MAX_BYTES (10 * 1024 * 1024)
+
+static void mk1_set_log_path(char *dst, size_t dst_size, const char *path)
+{
+    if (!dst || dst_size == 0) return;
+    if (!path || !path[0]) {
+        dst[0] = '\0';
+        return;
+    }
+
+    snprintf(dst, dst_size, "%s", path);
+}
+
+void mk1_device_set_encoder_log_path(const char *path) { mk1_set_log_path(g_encoder_log_path, sizeof(g_encoder_log_path), path); }
+void mk1_device_set_timing_log_path(const char *path) { mk1_set_log_path(g_timing_log_path, sizeof(g_timing_log_path), path); }
+
+static void mk1_vwrite_capped_log(const char *path, const char *fmt, va_list args)
+{
+    va_list measure_args;
+    va_list render_args;
+    int needed = 0;
+    struct stat st;
+    char stack_buf[1024];
+    char *line = stack_buf;
+    FILE *fp = NULL;
+
+    if (!path || !path[0]) return;
+
+    va_copy(measure_args, args);
+    needed = vsnprintf(NULL, 0, fmt, measure_args);
+    va_end(measure_args);
+    if (needed < 0) return;
+
+    if ((size_t)needed + 1 > sizeof(stack_buf)) {
+        line = malloc((size_t)needed + 1);
+        if (!line) return;
+    }
+
+    va_copy(render_args, args);
+    vsnprintf(line, (size_t)needed + 1, fmt, render_args);
+    va_end(render_args);
+
+    if (stat(path, &st) == 0 &&
+        (uint64_t)st.st_size + (uint64_t)needed + 1 > (uint64_t)MK1_LOG_FILE_MAX_BYTES) {
+        fp = fopen(path, "w");
+        if (fp) {
+            static const char wrap_marker[] = "--- mk1-device log wrapped at 10 MiB ---\n";
+            fwrite(wrap_marker, 1, sizeof(wrap_marker) - 1, fp);
+        }
+    } else {
+        fp = fopen(path, "a");
+    }
+
+    if (fp) {
+        fwrite(line, 1, (size_t)needed, fp);
+        fputc('\n', fp);
+        fflush(fp);
+        fclose(fp);
+    }
+
+    if (line != stack_buf) free(line);
+}
+
+static void mk1_write_capped_log(const char *path, const char *fmt, ...)
+{
+    va_list args;
+
+    va_start(args, fmt);
+    mk1_vwrite_capped_log(path, fmt, args);
+    va_end(args);
+}
 
 static bool mk1_timing_trace_enabled(void)
 {
@@ -148,14 +222,30 @@ static void mk1_timing_log(const char *fmt, ...)
     fprintf(stderr, "\n");
     va_end(args);
 
-    if (g_timing_log) {
-        va_start(args, fmt);
-        fprintf(g_timing_log, "[timing]  ");
-        vfprintf(g_timing_log, fmt, args);
-        fprintf(g_timing_log, "\n");
-        fflush(g_timing_log);
-        va_end(args);
+    va_start(args, fmt);
+    {
+        va_list prefixed_args;
+        int needed = 0;
+        char stack_buf[1024];
+        char *line = stack_buf;
+
+        va_copy(prefixed_args, args);
+        needed = vsnprintf(NULL, 0, fmt, prefixed_args);
+        va_end(prefixed_args);
+        if (needed >= 0) {
+            if ((size_t)needed + 1 > sizeof(stack_buf)) {
+                line = malloc((size_t)needed + 1);
+            }
+            if (line) {
+                va_copy(prefixed_args, args);
+                vsnprintf(line, (size_t)needed + 1, fmt, prefixed_args);
+                va_end(prefixed_args);
+                mk1_write_capped_log(g_timing_log_path, "[timing]  %s", line);
+                if (line != stack_buf) free(line);
+            }
+        }
     }
+    va_end(args);
 }
 
 static int32_t mk1_uc_send_ep1_command(mk1_user_client_t *client,
@@ -1089,18 +1179,35 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
     }
 
     // Log changed bytes to encoder log so we can identify unmapped encoder positions.
-    if (dev->ep1_len33_prev_valid && g_encoder_log) {
+    if (dev->ep1_len33_prev_valid && g_encoder_log_path[0]) {
         bool any_changed = false;
+        char line[1024];
+        size_t used = 0;
+
+        used += (size_t)snprintf(line + used, sizeof(line) - used, "%s", "[encoder] len33:");
         for (int b = 0; b < 33; b++) {
             if (data[b] != dev->ep1_len33_prev[b]) {
-                if (!any_changed) {
-                    fprintf(g_encoder_log, "[encoder] len33:");
-                    any_changed = true;
+                int written;
+
+                any_changed = true;
+                if (used >= sizeof(line)) continue;
+                written = snprintf(line + used,
+                                   sizeof(line) - used,
+                                   " [%d]%02x→%02x",
+                                   b,
+                                   dev->ep1_len33_prev[b],
+                                   data[b]);
+                if (written < 0) continue;
+                if ((size_t)written >= sizeof(line) - used) {
+                    used = sizeof(line);
+                } else {
+                    used += (size_t)written;
                 }
-                fprintf(g_encoder_log, " [%d]%02x→%02x", b, dev->ep1_len33_prev[b], data[b]);
             }
         }
-        if (any_changed) { fprintf(g_encoder_log, "\n"); fflush(g_encoder_log); }
+        if (any_changed) {
+            mk1_write_capped_log(g_encoder_log_path, "%s", line);
+        }
     }
 
     static const struct {
@@ -1175,16 +1282,15 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
 
         if (chosen_delta != 0) {
             float normalized = (float)chosen_delta / 255.0f;
-            if (g_encoder_log) {
-                fprintf(g_encoder_log,
-                        "[mk1-usb] knob %s delta_a=%d delta_b=%d dir=%s chosen=%d normalized=%.4f\n",
-                        knob_map[i].name,
-                        (int)delta_primary,
-                        (int)delta_secondary,
-                        value_increased ? "inc" : "dec",
-                        (int)chosen_delta,
-                        (double)normalized);
-                fflush(g_encoder_log);
+            if (g_encoder_log_path[0]) {
+                mk1_write_capped_log(g_encoder_log_path,
+                                     "[mk1-usb] knob %s delta_a=%d delta_b=%d dir=%s chosen=%d normalized=%.4f",
+                                     knob_map[i].name,
+                                     (int)delta_primary,
+                                     (int)delta_secondary,
+                                     value_increased ? "inc" : "dec",
+                                     (int)chosen_delta,
+                                     (double)normalized);
             }
             mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
         }

@@ -22,11 +22,15 @@
 //      -> we push SETFOCUS after receiving instance name
 
 #include "mk1_server.h"
+#include "bridge.h"
 #include "../mk1-ipc/mk1_ipc.h"   // protocol constants
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+#define fprintf  mk1_bridge_fprintf
+#define vfprintf mk1_bridge_vfprintf
 
 // ---------------------------------------------------------------------------
 // Message builder (native LE, same as mk1_ipc.c)

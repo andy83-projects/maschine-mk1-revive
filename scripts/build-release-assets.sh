@@ -34,6 +34,8 @@ mkdir -p "${ZIP_ROOT}"
 install -m 755 "${BUILD_DIR}/mk1-bridge" "${ZIP_ROOT}/mk1-bridge"
 install -m 644 "${REPO_ROOT}/mk1-bridge/com.dragco.mk1-bridge.plist" \
     "${ZIP_ROOT}/com.dragco.mk1-bridge.plist"
+cp -r "${REPO_ROOT}/build/MK1 Revive.app" "${ZIP_ROOT}/MK1 Revive.app"
+xattr -cr "${ZIP_ROOT}/MK1 Revive.app"
 
 rm -f "${ZIP_DEST}"
 (

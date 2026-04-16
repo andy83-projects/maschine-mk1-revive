@@ -22,10 +22,14 @@ xcodebuild -project "${REPO_ROOT}/maschine-mk1-revive.xcodeproj" \
     -configuration "${CONFIGURATION}" \
     build
 
+bash "${REPO_ROOT}/mk1-menubar/build.sh"
+
 install -d "${STAGE_ROOT}/usr/local/bin"
 install -d "${STAGE_ROOT}/Library/LaunchAgents"
+install -d "${STAGE_ROOT}/Applications"
 install -m 755 "${BINARY_PATH}" "${STAGE_ROOT}/usr/local/bin/mk1-bridge"
 install -m 644 "${PLIST_SOURCE}" "${STAGE_ROOT}/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
+cp -r "${REPO_ROOT}/build/MK1 Revive.app" "${STAGE_ROOT}/Applications/MK1 Revive.app"
 xattr -cr "${STAGE_ROOT}"
 find "${STAGE_ROOT}" -name '._*' -delete
 

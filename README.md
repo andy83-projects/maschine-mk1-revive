@@ -28,7 +28,7 @@ Entirely userspace. No DriverKit, no kernel code, no special entitlements.
 registers the `NIHWMainHandler` CFMessagePort itself. It owns both ends: full IPC
 handshake with the Maschine app and direct IOKit USB bulk transfers to the hardware.
 
-Working as of 2026-04-13:
+Working as of 2026-04-16:
 - Maschine software detects the MK1 in its controller list
 - Both displays render correctly (ST7529, EP8 bulk, 170×64 grayscale)
 - Status screen ("Open Maschine") shown on both displays at bridge start and when Maschine exits
@@ -49,6 +49,7 @@ Working as of 2026-04-13:
 | `mk1-usb` | static lib | Claim USB device, read/write HID reports |
 | `mk1-ipc` | static lib | CFMessagePort handshake + NI IPC protocol |
 | `mk1-bridge` | daemon | Glues USB ↔ IPC, runs as launchd agent |
+| `mk1-menubar` | app bundle | Menu bar app: start/stop/restart service + settings panel |
 | `mk1-shim` | dylib | DYLD_INSERT_LIBRARIES shim for logging/debugging IOKit calls |
 
 ## Prior Art
@@ -118,26 +119,32 @@ Targets build order: `mk1-usb` → `mk1-ipc` → `mk1-bridge`
 
 The `mk1-shim` target builds independently.
 
+The menu bar app is built separately:
+
+```bash
+bash mk1-menubar/build.sh
+# Output: build/MK1 Revive.app
+```
+
 ## Running
 
-The bridge now enables partial display updates by default. Small display regions
-are sent as partial ST7529 window writes, while larger redraws fall back to the
-existing full-frame path.
+The bridge runs as a launchd agent. Use the **MK1 Revive** menu bar app (installed to
+`/Applications/MK1 Revive.app`) to start, stop, and restart the service, and to adjust
+settings without touching the terminal.
 
-Recommended default run:
+To start manually:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist
+```
+
+Or run the bridge directly for development:
 
 ```bash
 ./build/Debug/mk1-bridge
 ```
 
-Tune the partial-display cutoff with:
-
-```bash
-./build/Debug/mk1-bridge --partial_display_max=2048
-./build/Debug/mk1-bridge --partial_display_max=3072
-```
-
-Other useful flags:
+Useful flags:
 
 ```bash
 ./build/Debug/mk1-bridge --display_tick_ms=16
@@ -145,75 +152,103 @@ Other useful flags:
 ./build/Debug/mk1-bridge --help
 ```
 
-For latency instrumentation during testing:
+## Configuration
 
-```bash
-MK1_TIMING_TRACE=1 ./build/Debug/mk1-bridge --partial_display_max=2048
-```
+All tunable parameters can be set via the **Settings…** panel in the MK1 Revive menu bar app,
+or by setting environment variables in the launchd plist's `EnvironmentVariables` key.
+
+### Pad sensitivity
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MK1_PAD_HIT_ON` | `300` | Minimum ADC pressure (0–4095) to trigger a pad strike |
+| `MK1_PAD_HIT_OFF` | `150` | ADC pressure must fall below this to register release (hysteresis) |
+| `MK1_PAD_PRESSURE` | `200` | Minimum change to forward a pressure-update event (reduces 700Hz flooding) |
+| `MK1_PAD_DEBOUNCE_MS` | `10` | Milliseconds between hit-off and next hit-on (prevents rubber bounce) |
+
+### Display
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MK1_DISPLAY_TICK_MS` | `16` | Display flush timer interval in ms (16 ≈ 60 fps) |
+
+### Integration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MK1_AUTO_OPEN_MASCHINE` | off | Auto-launch Maschine when bridge starts |
+| `MK1_AUTO_CLOSE_MASCHINE` | off | Auto-quit Maschine when bridge stops |
+| `MK1_MASCHINE_EXEC` | auto | Full path to Maschine 2 executable |
+| `MK1_SUPPRESS_APPLE_PROJECT_DIM_CLUSTER` | off | Suppress spurious LED-dim cluster on Apple Silicon |
+
+### Diagnostics
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MK1_VERBOSE_IO` | off | Log every USB bulk transfer to `/tmp/mk1-bridge.log` |
+| `MK1_TIMING_TRACE` | off | Log IPC and USB timing measurements |
 
 ## Install
 
-Current release packaging installs:
+The installer package installs:
 
-- the bridge binary to `/usr/local/bin/mk1-bridge`
-- the LaunchAgent plist to `/Library/LaunchAgents/com.dragco.mk1-bridge.plist`
+- `mk1-bridge` daemon → `/usr/local/bin/mk1-bridge`
+- LaunchAgent plist → `/Library/LaunchAgents/com.dragco.mk1-bridge.plist`
+- **MK1 Revive** menu bar app → `/Applications/MK1 Revive.app`
 
-Current release packaging also includes a matching uninstaller package:
+A matching uninstaller package is also provided.
 
-- `maschine-mk1-revive-v<version>-macos-uninstaller.pkg`
+### After install
+
+The bridge starts automatically via launchd. Open `/Applications/MK1 Revive.app` to manage
+the service and configure settings. To auto-launch the menu bar app at login, add it via:
+
+```
+System Settings → General → Login Items → add MK1 Revive
+```
 
 ### Unsigned Package Install
 
 The current GitHub package release is unsigned. macOS may warn that the package
 or installed binary is from an unidentified developer.
 
-If the package opens normally, install it and then load the LaunchAgent:
-
-```bash
-launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist
-launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
-```
+If the package opens normally, install it. The LaunchAgent starts automatically.
 
 If macOS blocks the package or binary, use one of these paths:
 
 1. In Finder, right-click the `.pkg` and choose `Open`.
-2. If macOS still blocks it, open `System Settings` -> `Privacy & Security` and
+2. If macOS still blocks it, open `System Settings` → `Privacy & Security` and
    allow the blocked package or binary to run.
 3. If the installed binary is quarantined, clear quarantine manually and restart
    the LaunchAgent:
 
 ```bash
 sudo xattr -dr com.apple.quarantine /usr/local/bin/mk1-bridge
+sudo xattr -dr com.apple.quarantine "/Applications/MK1 Revive.app"
 launchctl bootout "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist
-launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
 ```
 
 ### Manual Install
 
-If the unsigned package path is too noisy, manual install is usually the lowest-friction
-option without paying for Apple Developer distribution certificates:
-
 ```bash
 sudo install -m 755 ./build/Release/mk1-bridge /usr/local/bin/mk1-bridge
 sudo install -m 644 ./mk1-bridge/com.dragco.mk1-bridge.plist /Library/LaunchAgents/com.dragco.mk1-bridge.plist
+sudo cp -r "build/MK1 Revive.app" /Applications/
+sudo xattr -cr "/Applications/MK1 Revive.app"
 launchctl bootstrap "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist
-launchctl kickstart -k "gui/$(id -u)/com.dragco.mk1-bridge"
+open "/Applications/MK1 Revive.app"
 ```
 
 ## Uninstall
 
-Preferred path:
-
-- Run the matching uninstaller package:
-  `maschine-mk1-revive-v<version>-macos-uninstaller.pkg`
-
-Manual removal does the same thing explicitly:
+Run the matching uninstaller package, or manually:
 
 ```bash
 launchctl bootout "gui/$(id -u)" /Library/LaunchAgents/com.dragco.mk1-bridge.plist 2>/dev/null || true
 sudo rm -f /Library/LaunchAgents/com.dragco.mk1-bridge.plist
 sudo rm -f /usr/local/bin/mk1-bridge
+sudo rm -rf "/Applications/MK1 Revive.app"
 sudo pkgutil --forget com.dragco.mk1-bridge
 ```
 
@@ -223,25 +258,25 @@ sudo pkgutil --forget com.dragco.mk1-bridge
 - [x] Intel Mac data collection (pcap, Frida trace, Ghidra kext RE)
 - [x] USB device claim (IOKit direct, not HID)
 - [x] IPC handshake (full NIHA impersonation including Serial Connect phase)
-- [x] Bridge daemon skeleton (`mk1-bridge`) — Maschine detects MK1 in controller list
-- [x] Display init (EP8, ST7529 17-command sequence; UI-mode scan direction `0xbc [0x02,0x01,0x01]`)
+- [x] Bridge daemon (`mk1-bridge`) — Maschine detects MK1 in controller list
+- [x] launchd agent plist (`com.dragco.mk1-bridge.plist`)
+- [x] MK1 Revive menu bar app — start/stop/restart service, settings panel
+- [x] Display init (EP8, ST7529 17-command sequence)
 - [x] LCD display pixel updates — full framebuffer composite + RAMWR; display renders correctly
 - [x] LED forwarding — all button/group/transport/pad-row/SA/pad-rubber LEDs confirmed working
-- [x] Pad input events — EP4 64-byte reports decoded; baseline from resting scan-table reports; pressure/hit-on/off forwarded
-- [x] Pad pressure throttle — updates gated at ≥200-count change to prevent 700Hz IPC flooding
+- [x] Pad input events — EP4 64-byte reports decoded; pressure/hit-on/off forwarded
+- [x] Pad sensitivity tunable at runtime via env vars or Settings panel (no recompile needed)
 - [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded
 - [x] Display backlight stays on — no longer toggles on button presses (resolved)
 - [x] Status screen — "Open Maschine" shown on both displays at start and when Maschine exits
 - [x] Master Section knobs — Volume, Tempo, Swing encoder events forwarded via IPC
-- [x] Screen area encoders — all 8 encoders mapped (byte pairs confirmed from hardware capture)
+- [x] Screen area encoders — all 8 encoders mapped
 - [x] USB hot-plug — bridge survives device unplug/replug; starts before device is connected
-- [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine can take 5-30 seconds to reconnect; restarting Maschine may be a faster path
-- [ ] First-launch input miss — after a fresh Maschine launch, the first button or pad press is ignored; second press works and lights correctly
-- [ ] Apple Silicon project-load LED anomaly — some projects still assert errant dim group LEDs on load; the non-group dim cluster now has an env-flagged workaround, but remaining group-button behavior still needs to be isolated and fixed cleanly
+- [~] Bridge reconnect — DEVICE_OFF triggers Maschine re-handshake but Maschine can take 5-30 seconds to reconnect
+- [ ] First-launch input miss — after a fresh Maschine launch, the first button or pad press is ignored
+- [ ] Apple Silicon project-load LED anomaly — some projects still assert errant dim group LEDs on load
 - [~] Physical DIN MIDI Out — basic CoreMIDI bridge working and hardware-verified with MIDI clock
 - [ ] Physical DIN MIDI In — packet path guessed from vendor USB traffic but not yet hardware-verified
-- [ ] launchd agent plist
-- [ ] End-to-end test with Maschine software (controller detected; pads, LEDs, display functional)
 
 ## LED Mapping Workflow
 
@@ -261,16 +296,10 @@ Recommended workflow:
 
 1. Load a project first and wait for the initial LED baseline.
 2. Use low-fanout controls that should only affect a small, local LED cluster.
-3. Prefer controls that still flow through the captured Packet B path, such as
-   `Group A`-`Group H`, `Auto Write`, `Snap`, `Modules Left`, `Modules Right`,
-   `Sampling`, `Browse`, `Control`, `Step`, `SA1`-`SA8`, and `Note Repeat`.
-4. Do not use scene-row / Packet A controls for project capture right now:
-   `Mute`, `Solo`, `Select`, `Duplicate`, `Navigate`, `Pad Mode`, `Pattern`,
-   `Scene`, `Shift`, `Erase`, `Grid`, `Record`, `Play`, and `TransportRight`.
-5. Avoid transport buttons and mode switches known to trigger broad LED refreshes,
-   especially `Play` and `Restart`.
-6. For direct physical probing, `MK1_LED_PROBE=1` now supports `phys[0..32]`.
-
-The goal is to capture small diffs that isolate a single button LED or a very small
-set of neighboring LEDs. Large transport-state changes make the results harder to
-trust.
+3. Prefer controls that flow through the captured Packet B path: `Group A`–`Group H`,
+   `Auto Write`, `Snap`, `Modules Left/Right`, `Sampling`, `Browse`, `Control`, `Step`,
+   `SA1`–`SA8`, `Note Repeat`.
+4. Avoid scene-row / Packet A controls: `Mute`, `Solo`, `Select`, `Duplicate`, `Navigate`,
+   `Pad Mode`, `Pattern`, `Scene`, `Shift`, `Erase`, `Grid`, `Record`, `Play`, `TransportRight`.
+5. Avoid transport buttons and mode switches known to trigger broad LED refreshes.
+6. For direct physical probing, `MK1_LED_PROBE=1` supports `phys[0..32]`.

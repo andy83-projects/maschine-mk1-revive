@@ -1768,19 +1768,13 @@ static void on_connect(void *ctx)
 // pair 0 = pad 1 (IPC idx 0), pair 15 = pad 16 (IPC idx 15).
 // No remap needed — pair index == IPC pad_index.
 
-// Minimum pressure change (out of 4095) required to forward a pressure_update event.
-// Filters ADC jitter at 700Hz without suppressing real aftertouch changes.
-// ~5% of full range — coarse enough to avoid flooding, fine enough to feel responsive.
-#define PAD_PRESSURE_THRESHOLD  200
-// Hit-on threshold (~7.3% of 4095). Raised from original 256 to reduce rubber-matrix
-// crosstalk; debounce handles bounce so this only needs to beat crosstalk levels.
-// Tune up if rogue neighbour-pad hits persist; tune down if light taps don't register.
-#define PAD_HIT_ON_THRESHOLD    300
-// Hysteresis: release fires when pressure drops below this.
-#define PAD_HIT_OFF_THRESHOLD   150
-// Minimum nanoseconds between hit_off and next hit_on for the same pad.
-// Prevents rubber bounce from generating double-triggers on quick successive hits.
-#define PAD_DEBOUNCE_NS  10000000ULL   /* 10 ms — kills rubber bounce (<5ms), safe for 1/32 at 200 BPM */
+// Runtime-configurable pad thresholds (set via environment variables or MK1 Revive Settings).
+// Defaults: pressure=200, hit_on=300, hit_off=150, debounce=10ms.
+// Override at launch via MK1_PAD_PRESSURE, MK1_PAD_HIT_ON, MK1_PAD_HIT_OFF, MK1_PAD_DEBOUNCE_MS.
+static int      g_pad_pressure_threshold = 200;   // MK1_PAD_PRESSURE
+static int      g_pad_hit_on_threshold   = 300;   // MK1_PAD_HIT_ON
+static int      g_pad_hit_off_threshold  = 150;   // MK1_PAD_HIT_OFF
+static uint64_t g_pad_debounce_ns        = 10000000ULL; // MK1_PAD_DEBOUNCE_MS (ms → ns)
 
 static uint16_t g_prev_pressure[16]      = {0};  // for hit_on/hit_off transitions
 static uint16_t g_sent_pressure[16]      = {0};  // last pressure value forwarded via IPC
@@ -1831,9 +1825,9 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
         uint32_t idx      = pads[i].index;    // 0-15; pair index == IPC pad_index
         uint16_t pressure = pads[i].pressure;
         uint16_t prev     = g_prev_pressure[idx];
-        bool     was_active = prev >= PAD_HIT_OFF_THRESHOLD;
+        bool     was_active = prev >= (uint16_t)g_pad_hit_off_threshold;
         bool     is_active =
-            pressure >= (was_active ? PAD_HIT_OFF_THRESHOLD : PAD_HIT_ON_THRESHOLD);
+            pressure >= (uint16_t)(was_active ? g_pad_hit_off_threshold : g_pad_hit_on_threshold);
 
         if (pressure == prev) continue;
 
@@ -1841,7 +1835,7 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
 
         if (!was_active && is_active) {
             // Debounce: suppress hit_on if we just released this pad within the window.
-            if (ts_ns - g_hit_off_time_ns[idx] < PAD_DEBOUNCE_NS) {
+            if (ts_ns - g_hit_off_time_ns[idx] < g_pad_debounce_ns) {
                 g_prev_pressure[idx] = pressure;
                 g_led_pad_pressure[idx] = pressure;
                 continue;
@@ -1861,7 +1855,7 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
             // pad held — only forward if pressure changed enough to be meaningful
             uint16_t sent = g_sent_pressure[idx];
             uint16_t delta = pressure > sent ? pressure - sent : sent - pressure;
-            if (delta >= PAD_PRESSURE_THRESHOLD) {
+            if (delta >= (uint16_t)g_pad_pressure_threshold) {
                 send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
                 g_sent_pressure[idx] = pressure;
             }
@@ -3121,6 +3115,10 @@ int main(int argc, char **argv)
     const char *timing_env = getenv("MK1_TIMING_TRACE");
 
     g_timing_trace = timing_env && timing_env[0] && strcmp(timing_env, "0") != 0;
+    g_pad_hit_on_threshold   = env_int_or_default("MK1_PAD_HIT_ON",        300);
+    g_pad_hit_off_threshold  = env_int_or_default("MK1_PAD_HIT_OFF",       150);
+    g_pad_pressure_threshold = env_int_or_default("MK1_PAD_PRESSURE",      200);
+    g_pad_debounce_ns = (uint64_t)env_int_or_default("MK1_PAD_DEBOUNCE_MS", 10) * 1000000ULL;
     g_display_tick_ms = env_int_or_default("MK1_DISPLAY_TICK_MS", 16);
     if (g_display_tick_ms <= 0) g_display_tick_ms = 16;
     g_display_partial_flush = true;

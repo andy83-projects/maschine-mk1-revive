@@ -7,13 +7,14 @@ private let kLabel      = "com.dragco.mk1-bridge"
 private let kSystemPlist = "/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
 private let kUserPlist   = NSHomeDirectory() + "/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
 // Prefer user-level plist (writable without admin). Fall back to system plist
-// for installs that haven't migrated yet.
-private let kPlist: String = {
+// for installs that haven't migrated yet. Computed each call so migration
+// taking effect mid-session is picked up immediately.
+private var kPlist: String {
     let fm = FileManager.default
     if fm.fileExists(atPath: kUserPlist)   { return kUserPlist }
     if fm.fileExists(atPath: kSystemPlist) { return kSystemPlist }
     return kUserPlist   // default target for fresh installs
-}()
+}
 private let kUIDDomain = "gui/\(getuid())"
 
 // MARK: - Plist migration

@@ -137,6 +137,11 @@ private struct SliderParam {
     let defaultVal: Int
     let unit: String
     let tooltip: String
+    var valueFormatter: ((Int) -> String)? = nil
+
+    func displayString(for val: Int) -> String {
+        valueFormatter?(val) ?? "\(val) \(unit)"
+    }
 }
 
 private struct BoolParam {
@@ -170,8 +175,9 @@ private let kDisplaySliders: [SliderParam] = [
 ]
 
 private let kEncoderSliders: [SliderParam] = [
-    SliderParam(envKey: "MK1_ENCODER_SENSITIVITY", label: "Encoder sensitivity", min: 25, max: 400, defaultVal: 100, unit: "%",
-                tooltip: "Scales the delta sent to Maschine for every encoder turn. 100% = hardware default; raise for coarser steps, lower for finer control."),
+    SliderParam(envKey: "MK1_ENCODER_SENSITIVITY", label: "Encoder sensitivity", min: 1, max: 40, defaultVal: 10, unit: "",
+                tooltip: "Scales the delta sent to Maschine for every encoder turn. ×1.0 = hardware default; higher = coarser/faster, lower = finer/slower.",
+                valueFormatter: { "×\(String(format: "%.1f", Double($0) / 10.0))" }),
 ]
 
 private let kIntegrationBools: [BoolParam] = [
@@ -387,7 +393,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         v.addSubview(slider)
         sliderControls[param.envKey] = slider
 
-        let valLbl = NSTextField(labelWithString: "\(param.defaultVal) \(param.unit)")
+        let valLbl = NSTextField(labelWithString: param.displayString(for: param.defaultVal))
         valLbl.alignment = .left
         valLbl.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         valLbl.frame = NSRect(x: sliderX + sliderW + 8, y: y, width: valueW, height: rowH)
@@ -466,7 +472,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         for p in kPadSliders + kDisplaySliders + kEncoderSliders {
             let intVal = env[p.envKey].flatMap(Int.init) ?? p.defaultVal
             sliderControls[p.envKey]?.integerValue = intVal
-            sliderLabels[p.envKey]?.stringValue = "\(intVal) \(p.unit)"
+            sliderLabels[p.envKey]?.stringValue = p.displayString(for: intVal)
         }
 
         for p in kIntegrationBools + kDiagBools {
@@ -524,17 +530,16 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @objc private func sliderChanged(_ sender: NSSlider) {
         guard let key = sender.identifier?.rawValue else { return }
-        // Find matching param for unit
-        let all = kPadSliders + kDisplaySliders
+        let all = kPadSliders + kDisplaySliders + kEncoderSliders
         if let p = all.first(where: { $0.envKey == key }) {
-            sliderLabels[key]?.stringValue = "\(sender.integerValue) \(p.unit)"
+            sliderLabels[key]?.stringValue = p.displayString(for: sender.integerValue)
         }
     }
 
     @objc private func resetTapped() {
         for p in kPadSliders + kDisplaySliders + kEncoderSliders {
             sliderControls[p.envKey]?.integerValue = p.defaultVal
-            sliderLabels[p.envKey]?.stringValue = "\(p.defaultVal) \(p.unit)"
+            sliderLabels[p.envKey]?.stringValue = p.displayString(for: p.defaultVal)
         }
         for p in kIntegrationBools + kDiagBools {
             checkControls[p.envKey]?.state = p.defaultVal ? .on : .off

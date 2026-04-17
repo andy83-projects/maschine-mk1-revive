@@ -2092,7 +2092,7 @@ mk1_device_t *mk1_device_open(void)
         char *end = NULL;
         long pct = strtol(enc_sens, &end, 10);
         if (end && *end == '\0' && pct > 0)
-            g_encoder_sensitivity = (float)pct / 100.0f;
+            g_encoder_sensitivity = (float)pct / 10.0f;
     }
     pthread_mutex_init(&dev->reply_lock, NULL);
     pthread_mutex_init(&dev->io_lock, NULL);

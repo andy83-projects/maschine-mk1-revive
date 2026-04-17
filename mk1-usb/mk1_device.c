@@ -122,8 +122,9 @@ struct mk1_user_client {
     mk1_uc_async_registration_t    encoder_read;
 };
 
-static char g_encoder_log_path[PATH_MAX] = {0};
-static char g_timing_log_path[PATH_MAX] = {0};
+static char  g_encoder_log_path[PATH_MAX] = {0};
+static char  g_timing_log_path[PATH_MAX] = {0};
+static float g_encoder_sensitivity = 1.0f;  // MK1_ENCODER_SENSITIVITY (percent, 100 = 1×)
 
 #define MK1_LOG_FILE_MAX_BYTES (10 * 1024 * 1024)
 
@@ -1281,16 +1282,17 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
         int8_t chosen_delta = (int8_t)(value_increased ? chosen_abs : -chosen_abs);
 
         if (chosen_delta != 0) {
-            float normalized = (float)chosen_delta / 255.0f;
+            float normalized = (float)chosen_delta / 255.0f * g_encoder_sensitivity;
             if (g_encoder_log_path[0]) {
                 mk1_write_capped_log(g_encoder_log_path,
-                                     "[mk1-usb] knob %s delta_a=%d delta_b=%d dir=%s chosen=%d normalized=%.4f",
+                                     "[mk1-usb] knob %s delta_a=%d delta_b=%d dir=%s chosen=%d normalized=%.4f (sens=%.2f)",
                                      knob_map[i].name,
                                      (int)delta_primary,
                                      (int)delta_secondary,
                                      value_increased ? "inc" : "dec",
                                      (int)chosen_delta,
-                                     (double)normalized);
+                                     (double)normalized,
+                                     (double)g_encoder_sensitivity);
             }
             mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
         }
@@ -2084,6 +2086,14 @@ mk1_device_t *mk1_device_open(void)
     dev->trace_reports = env_flag_enabled("MK1_USB_TRACE");
     dev->trace_scan_reports = env_flag_enabled("MK1_SCAN_TRACE");
     dev->trace_all_pipes = env_flag_enabled("MK1_ALL_PIPE_TRACE");
+
+    const char *enc_sens = getenv("MK1_ENCODER_SENSITIVITY");
+    if (enc_sens && enc_sens[0]) {
+        char *end = NULL;
+        long pct = strtol(enc_sens, &end, 10);
+        if (end && *end == '\0' && pct > 0)
+            g_encoder_sensitivity = (float)pct / 100.0f;
+    }
     pthread_mutex_init(&dev->reply_lock, NULL);
     pthread_mutex_init(&dev->io_lock, NULL);
 

@@ -12,6 +12,7 @@ BINARY_NAME="mk1-menubar"
 echo "==> Compiling ${BINARY_NAME}..."
 swiftc \
     -framework AppKit \
+    -framework ServiceManagement \
     -O \
     -target arm64-apple-macosx14.0 \
     "${SCRIPT_DIR}/main.swift" \
@@ -43,5 +44,4 @@ echo "To install, run:"
 echo "  cp -r \"${APP_BUNDLE}\" /Applications/"
 echo "  open \"/Applications/${APP_NAME}.app\""
 echo ""
-echo "To auto-launch at login, add it via:"
-echo "  System Settings → General → Login Items"
+echo "Launch at Login can be toggled from the MK1 Revive menu bar icon."

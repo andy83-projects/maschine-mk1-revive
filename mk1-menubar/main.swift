@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 // MARK: - Service management
 
@@ -50,6 +51,28 @@ func shell(_ args: String...) -> Int32 {
     try? task.run()
     task.waitUntilExit()
     return task.terminationStatus
+}
+
+// MARK: - Login item (SMAppService)
+
+func loginItemEnabled() -> Bool {
+    SMAppService.mainApp.status == .enabled
+}
+
+func setLoginItem(_ enable: Bool) {
+    do {
+        if enable {
+            try SMAppService.mainApp.register()
+        } else {
+            try SMAppService.mainApp.unregister()
+        }
+    } catch {
+        let alert = NSAlert()
+        alert.messageText = enable ? "Could not enable Launch at Login" : "Could not disable Launch at Login"
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
 }
 
 func startService() {
@@ -144,6 +167,11 @@ private let kPadSliders: [SliderParam] = [
 private let kDisplaySliders: [SliderParam] = [
     SliderParam(envKey: "MK1_DISPLAY_TICK_MS",   label: "Display refresh interval",  min: 8,   max: 100, defaultVal: 16,  unit: "ms",
                 tooltip: "How often the bridge flushes pending display frames to the hardware (16 ms ≈ 60 fps)."),
+]
+
+private let kEncoderSliders: [SliderParam] = [
+    SliderParam(envKey: "MK1_ENCODER_SENSITIVITY", label: "Encoder sensitivity", min: 25, max: 400, defaultVal: 100, unit: "%",
+                tooltip: "Scales the delta sent to Maschine for every encoder turn. 100% = hardware default; raise for coarser steps, lower for finer control."),
 ]
 
 private let kIntegrationBools: [BoolParam] = [
@@ -276,6 +304,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         y += secGap
         addSectionHeader("Display", to: canvas, y: &y)
         for p in kDisplaySliders { addSliderRow(p, to: canvas, y: &y) }
+
+        y += secGap
+        addSectionHeader("Encoders", to: canvas, y: &y)
+        for p in kEncoderSliders { addSliderRow(p, to: canvas, y: &y) }
 
         y += secGap
         addSectionHeader("Integration", to: canvas, y: &y)
@@ -431,7 +463,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private func loadCurrentValues() {
         let env = readEnvVarsFromPlist()
 
-        for p in kPadSliders + kDisplaySliders {
+        for p in kPadSliders + kDisplaySliders + kEncoderSliders {
             let intVal = env[p.envKey].flatMap(Int.init) ?? p.defaultVal
             sliderControls[p.envKey]?.integerValue = intVal
             sliderLabels[p.envKey]?.stringValue = "\(intVal) \(p.unit)"
@@ -450,7 +482,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private func collectEnvVars() -> [String: String] {
         var vars: [String: String] = [:]
 
-        for p in kPadSliders + kDisplaySliders {
+        for p in kPadSliders + kDisplaySliders + kEncoderSliders {
             if let s = sliderControls[p.envKey] {
                 vars[p.envKey] = "\(s.integerValue)"
             }
@@ -500,7 +532,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func resetTapped() {
-        for p in kPadSliders + kDisplaySliders {
+        for p in kPadSliders + kDisplaySliders + kEncoderSliders {
             sliderControls[p.envKey]?.integerValue = p.defaultVal
             sliderLabels[p.envKey]?.stringValue = "\(p.defaultVal) \(p.unit)"
         }
@@ -618,6 +650,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.target = self
         menu.addItem(settings)
 
+        let launchAtLogin = NSMenuItem(title: "Launch at Login", action: #selector(launchAtLoginTapped), keyEquivalent: "")
+        launchAtLogin.target = self
+        launchAtLogin.state = loginItemEnabled() ? .on : .off
+        menu.addItem(launchAtLogin)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
@@ -629,6 +666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global().async { restartService() }
     }
     @objc private func settingsTapped() { SettingsWindowController.shared.show() }
+    @objc private func launchAtLoginTapped() { setLoginItem(!loginItemEnabled()) }
 }
 
 // MARK: - Entry point

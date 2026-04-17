@@ -2,13 +2,11 @@
 set -eu
 
 BINARY_PATH="/usr/local/bin/mk1-bridge"
-PLIST_PATH="/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
+SYSTEM_PLIST="/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
 LABEL="com.dragco.mk1-bridge"
 
 chown root:wheel "${BINARY_PATH}"
 chmod 755 "${BINARY_PATH}"
-chown root:wheel "${PLIST_PATH}"
-chmod 644 "${PLIST_PATH}"
 
 console_user="$(stat -f %Su /dev/console 2>/dev/null || true)"
 if [ -z "${console_user}" ] || [ "${console_user}" = "root" ] || [ "${console_user}" = "loginwindow" ]; then
@@ -20,12 +18,29 @@ if [ -z "${console_uid}" ]; then
     exit 0
 fi
 
-launchctl bootstrap "gui/${console_uid}" "${PLIST_PATH}" >/dev/null 2>&1 || true
+# Resolve the console user's home directory.
+user_home="$(dscl . -read "/Users/${console_user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+if [ -z "${user_home}" ]; then
+    user_home="$(eval echo "~${console_user}")"
+fi
+
+USER_AGENTS_DIR="${user_home}/Library/LaunchAgents"
+USER_PLIST="${USER_AGENTS_DIR}/com.dragco.mk1-bridge.plist"
+
+# Move the plist from the system location to the user's LaunchAgents folder.
+# This keeps the plist user-writable so MK1 Revive Settings never needs admin.
+launchctl bootout "gui/${console_uid}" "${SYSTEM_PLIST}" >/dev/null 2>&1 || true
+mkdir -p "${USER_AGENTS_DIR}"
+chown "${console_user}" "${USER_AGENTS_DIR}"
+cp "${SYSTEM_PLIST}" "${USER_PLIST}"
+chown "${console_user}" "${USER_PLIST}"
+chmod 644 "${USER_PLIST}"
+rm -f "${SYSTEM_PLIST}"
+
+launchctl bootstrap "gui/${console_uid}" "${USER_PLIST}" >/dev/null 2>&1 || true
 launchctl kickstart -k "gui/${console_uid}/${LABEL}" >/dev/null 2>&1 || true
 
 # Restart the menu bar app as the console user so the new bundle takes effect.
-# pkill the old instance (if any), then open the new one via launchctl asuser
-# so it runs in the user's GUI session (not as root).
 pkill -x mk1-menubar >/dev/null 2>&1 || true
 sleep 0.5
 launchctl asuser "${console_uid}" open "/Applications/MK1 Revive.app" >/dev/null 2>&1 || true

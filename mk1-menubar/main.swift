@@ -3,15 +3,75 @@ import ServiceManagement
 
 // MARK: - Service management
 
-private let kLabel    = "com.dragco.mk1-bridge"
-// Check system-wide /Library/LaunchAgents first (our installer puts it there),
-// fall back to user-level ~/Library/LaunchAgents.
+private let kLabel      = "com.dragco.mk1-bridge"
+private let kSystemPlist = "/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
+private let kUserPlist   = NSHomeDirectory() + "/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
+// Prefer user-level plist (writable without admin). Fall back to system plist
+// for installs that haven't migrated yet.
 private let kPlist: String = {
-    let system = "/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
-    let user   = NSHomeDirectory() + "/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
-    return FileManager.default.fileExists(atPath: system) ? system : user
+    let fm = FileManager.default
+    if fm.fileExists(atPath: kUserPlist)   { return kUserPlist }
+    if fm.fileExists(atPath: kSystemPlist) { return kSystemPlist }
+    return kUserPlist   // default target for fresh installs
 }()
 private let kUIDDomain = "gui/\(getuid())"
+
+// MARK: - Plist migration
+
+/// If the plist is at the system path, offer to migrate it to ~/Library/LaunchAgents
+/// so future settings writes require no admin password.
+func migrateToUserPlistIfNeeded() {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: kSystemPlist),
+          !fm.fileExists(atPath: kUserPlist) else { return }
+
+    let alert = NSAlert()
+    alert.messageText = "Move bridge settings to your user folder?"
+    alert.informativeText = "The bridge config is currently at /Library/LaunchAgents (system-wide). Moving it to ~/Library/LaunchAgents lets you change settings without an admin password. This requires your password once to remove the old file."
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "Move Now")
+    alert.addButton(withTitle: "Not Now")
+    guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+    // Read the system plist content
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: kSystemPlist)) else {
+        showError("Could not read \(kSystemPlist)")
+        return
+    }
+
+    // Ensure ~/Library/LaunchAgents exists
+    try? fm.createDirectory(atPath: NSHomeDirectory() + "/Library/LaunchAgents",
+                            withIntermediateDirectories: true)
+
+    // Write to user path
+    guard (try? data.write(to: URL(fileURLWithPath: kUserPlist))) != nil else {
+        showError("Could not write \(kUserPlist)")
+        return
+    }
+
+    // Bootout from system plist, then bootstrap from user plist
+    // (bootout may need admin if the service was loaded from the system path)
+    let wasRunning = serviceIsRunning()
+    let bootoutScript = "do shell script \"launchctl bootout gui/$(id -u) '\(kSystemPlist)' 2>/dev/null; rm -f '\(kSystemPlist)'\" with administrator privileges"
+    var err: NSDictionary?
+    NSAppleScript(source: bootoutScript)?.executeAndReturnError(&err)
+    if let err = err {
+        // Non-fatal: the user plist was written; old one may linger until reboot
+        print("[mk1-menubar] admin bootout failed: \(err[NSAppleScript.errorMessage as NSString] ?? "?")")
+    }
+
+    if wasRunning {
+        shell("bootstrap", kUIDDomain, kUserPlist)
+    }
+}
+
+private func showError(_ msg: String) {
+    let a = NSAlert()
+    a.messageText = "Migration failed"
+    a.informativeText = msg
+    a.alertStyle = .critical
+    a.runModal()
+}
 
 /// Returns true if the service is loaded AND has a live PID.
 func serviceIsRunning() -> Bool {
@@ -592,6 +652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // LSUIElement=true in Info.plist handles accessory mode — no setActivationPolicy needed
+        migrateToUserPlistIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             if let image = makeMenuBarIcon() {

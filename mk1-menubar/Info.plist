@@ -6,7 +6,7 @@
     <key>CFBundleExecutable</key>
     <string>mk1-menubar</string>
     <key>CFBundleIdentifier</key>
-    <string>com.dragco.mk1-menubar</string>
+    <string>com.dragco.mk1-revive</string>
     <key>CFBundleName</key>
     <string>MK1 Revive</string>
     <key>CFBundleDisplayName</key>
@@ -26,5 +26,9 @@
     <true/>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
 </dict>
 </plist>

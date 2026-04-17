@@ -76,20 +76,32 @@ func restartService() {
 
 // MARK: - Menu bar icon
 
-func makeMenuBarIcon() -> NSImage {
-    // Load the MK1 photo from the app bundle (menubar.png / menubar@2x.png)
+func makeMenuBarIcon() -> NSImage? {
+    // Treat zero-size / empty reps as invalid so the item never becomes invisible.
+    func isUsableStatusImage(_ image: NSImage) -> Bool {
+        image.size.width > 0 && image.size.height > 0 && !image.representations.isEmpty
+    }
+
+    // Load the MK1 photo from the app bundle (menubar.png / menubar@2x.png).
     if let url = Bundle.main.url(forResource: "menubar", withExtension: "png"),
-       let img = NSImage(contentsOf: url) {
-        img.isTemplate = false  // show in full colour
+       let img = NSImage(contentsOf: url),
+       isUsableStatusImage(img) {
+        img.isTemplate = false
+        print("[mk1-menubar] using bundled menubar icon: \(url.path)")
         return img
     }
-    // Fallback: SF Symbol
+
+    // Fallback: SF Symbol.
     if #available(macOS 11.0, *),
-       let sym = NSImage(systemSymbolName: "square.grid.2x2.fill", accessibilityDescription: "MK1 Revive") {
+       let sym = NSImage(systemSymbolName: "square.grid.2x2.fill", accessibilityDescription: "MK1 Revive"),
+       isUsableStatusImage(sym) {
         sym.isTemplate = true
+        print("[mk1-menubar] bundled icon unavailable, falling back to SF Symbol")
         return sym
     }
-    return NSImage()
+
+    print("[mk1-menubar] no usable menu bar image found; using text fallback")
+    return nil
 }
 
 // MARK: - Settings model
@@ -545,8 +557,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // LSUIElement=true in Info.plist handles accessory mode — no setActivationPolicy needed
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
-            btn.image = makeMenuBarIcon()
-            btn.imageScaling = .scaleProportionallyDown
+            if let image = makeMenuBarIcon() {
+                btn.image = image
+                btn.imageScaling = .scaleProportionallyDown
+                btn.title = ""
+            } else {
+                btn.image = nil
+                btn.title = "MK1"
+            }
             btn.toolTip = "MK1 Revive"
         }
 

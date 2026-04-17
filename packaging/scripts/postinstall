@@ -23,4 +23,11 @@ fi
 launchctl bootstrap "gui/${console_uid}" "${PLIST_PATH}" >/dev/null 2>&1 || true
 launchctl kickstart -k "gui/${console_uid}/${LABEL}" >/dev/null 2>&1 || true
 
+# Restart the menu bar app as the console user so the new bundle takes effect.
+# pkill the old instance (if any), then open the new one via launchctl asuser
+# so it runs in the user's GUI session (not as root).
+pkill -x mk1-menubar >/dev/null 2>&1 || true
+sleep 0.5
+launchctl asuser "${console_uid}" open "/Applications/MK1 Revive.app" >/dev/null 2>&1 || true
+
 exit 0

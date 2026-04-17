@@ -13,6 +13,7 @@ echo "==> Compiling ${BINARY_NAME}..."
 swiftc \
     -framework AppKit \
     -O \
+    -target arm64-apple-macosx14.0 \
     "${SCRIPT_DIR}/main.swift" \
     -o "${BUILD_DIR}/${BINARY_NAME}"
 

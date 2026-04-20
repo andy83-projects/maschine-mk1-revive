@@ -3,6 +3,8 @@
 A userspace driver shim to make the Native Instruments Maschine MK1 work on Apple Silicon macOS,
 with the original Maschine software.
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-andy83-FFDD00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/andy83)
+
 ## Problem
 
 The MK1 relied on `NIUSBMaschineController.kext` — a kernel extension that:

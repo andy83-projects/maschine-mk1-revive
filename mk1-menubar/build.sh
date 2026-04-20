@@ -34,6 +34,7 @@ cp "${SCRIPT_DIR}/menubar@2x.png"   "${CONTENTS}/Resources/menubar@2x.png"
 #  name if you want a proper signature)
 if command -v codesign &>/dev/null; then
     echo "==> Code-signing (ad-hoc)..."
+    xattr -cr "${APP_BUNDLE}"
     codesign --force --sign - "${APP_BUNDLE}"
 fi
 

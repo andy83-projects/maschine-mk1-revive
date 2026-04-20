@@ -28,7 +28,7 @@ Entirely userspace. No DriverKit, no kernel code, no special entitlements.
 registers the `NIHWMainHandler` CFMessagePort itself. It owns both ends: full IPC
 handshake with the Maschine app and direct IOKit USB bulk transfers to the hardware.
 
-Working as of 2026-04-16:
+Working as of 2026-04-20:
 - Maschine software detects the MK1 in its controller list
 - Both displays render correctly (ST7529, EP8 bulk, 170×64 grayscale)
 - Status screen ("Open Maschine") shown on both displays at bridge start and when Maschine exits
@@ -266,7 +266,7 @@ sudo pkgutil --forget com.dragco.mk1-bridge
 - [x] Display init (EP8, ST7529 17-command sequence)
 - [x] LCD display pixel updates — full framebuffer composite + RAMWR; display renders correctly
 - [x] LED forwarding — all button/group/transport/pad-row/SA/pad-rubber LEDs confirmed working
-- [x] Pad input events — EP4 64-byte reports decoded; pressure/hit-on/off forwarded
+- [x] Pad input events — EP4 64-byte reports decoded; pressure/hit-on/off forwarded; rogue hit bugs fixed
 - [x] Pad sensitivity tunable at runtime via env vars or Settings panel (no recompile needed)
 - [x] Button input events — EP1 short reports decoded; group/transport/screen buttons forwarded
 - [x] Display backlight stays on — no longer toggles on button presses (resolved)
@@ -306,3 +306,29 @@ Recommended workflow:
    `Pad Mode`, `Pattern`, `Scene`, `Shift`, `Erase`, `Grid`, `Record`, `Play`, `TransportRight`.
 5. Avoid transport buttons and mode switches known to trigger broad LED refreshes.
 6. For direct physical probing, `MK1_LED_PROBE=1` supports `phys[0..32]`.
+
+## Changelog
+
+### v0.3.1 — 2026-04-20
+- **Fix rogue pad hits** — EP4 scan table reports at non-zero ring phase (phases 1–15) were
+  escaping the classifier and being processed as pad pressure, triggering phantom strikes on
+  arbitrary pads. Added a phase=0 guard: pressure reports are physically constrained to phase 0
+  (pad 0 rests at 0x0000; max pressure 4095 keeps the top nibble at 0), so any report with
+  phase ≠ 0 is discarded as a misidentified scan table.
+- **Fix orphaned hit-off events** — `was_active` was derived from `g_prev_pressure ≥ hit_off_threshold`,
+  which could become true without a `hit_on` ever being sent (pressure drifting into the 150–299
+  hysteresis band). Changed to `g_sent_pressure[idx] > 0` so `was_active` reflects only whether
+  a `hit_on` was actually dispatched.
+- **Improve scan table classifier** — relaxed the ring-pattern check to compare top nibbles only,
+  with an additional guard that both ADC channels agree on the lower 12 bits. This catches
+  button-state-encoded scan table entries that previously leaked through.
+
+### v0.2.1 — 2026-04-16
+- Move bridge/runtime logs under `/tmp/maschine-mk1-revive/`
+- Cap bridge, encoder, and timing logs at 10 MiB with wraparound
+- Route bridge stderr-style diagnostics through the capped bridge log
+
+### v0.2.0 — 2026-04-14
+- Menu bar app (MK1 Revive) for service management and settings
+- Runtime-configurable pad thresholds via env vars and Settings panel
+- Encoder sensitivity multiplier control

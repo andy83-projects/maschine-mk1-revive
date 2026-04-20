@@ -1923,10 +1923,14 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
     uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
     for (uint8_t i = 0; i < count && i < 16; i++) {
-        uint32_t idx      = pads[i].index;    // 0-15; pair index == IPC pad_index
+        uint32_t idx      = pads[i].index;    // EP4 pair == IPC pad_index (confirmed)
         uint16_t pressure = pads[i].pressure;
         uint16_t prev     = g_prev_pressure[idx];
-        bool     was_active = prev >= (uint16_t)g_pad_hit_off_threshold;
+        // was_active is true only if a hit_on was actually sent (g_sent_pressure > 0).
+        // Using g_prev_pressure >= hit_off_threshold caused orphaned hit_off events:
+        // pressure drifting into [150,300) set was_active without a hit_on, then
+        // any subsequent drop below 150 emitted hit_off with no corresponding hit_on.
+        bool     was_active = g_sent_pressure[idx] > 0;
         bool     is_active =
             pressure >= (uint16_t)(was_active ? g_pad_hit_off_threshold : g_pad_hit_on_threshold);
 
@@ -1942,7 +1946,17 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
                 continue;
             }
             // pad struck — send hit_on then initial pressure_update
-            BTNLOG("pad idx=%u hit_on pressure=%u (%.3f)", idx, pressure, (double)value);
+            // Dump all 16 pressures to diagnose crosstalk / rogue hits.
+            {
+                char snap[256];
+                int  snap_off = 0;
+                for (uint8_t k = 0; k < 16 && k < count; k++) {
+                    snap_off += snprintf(snap + snap_off, sizeof(snap) - (size_t)snap_off,
+                                        " p%u=%u", k, pads[k].pressure);
+                }
+                BTNLOG("pad idx=%u hit_on pressure=%u (%.3f) snapshot:%s",
+                       idx, pressure, (double)value, snap);
+            }
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON,         value);
             send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
             g_sent_pressure[idx] = pressure;

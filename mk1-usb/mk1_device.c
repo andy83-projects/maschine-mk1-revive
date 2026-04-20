@@ -649,11 +649,18 @@ static bool mk1_is_scanned_button_report(const uint8_t *data, size_t len)
     }
 
     for (size_t i = 0; i < 16; i++) {
-        uint16_t current = read_le16(data + (i * 2));
-        uint16_t expected = (uint16_t)((read_le16(data) + (uint16_t)(i * 0x1000)) & 0xf000);
+        uint16_t current   = read_le16(data + (i * 2));
+        uint16_t expected  = (uint16_t)((read_le16(data) + (uint16_t)(i * 0x1000)) & 0xf000);
         uint16_t duplicate = read_le16(data + 32 + (i * 2));
 
-        if (current != expected || duplicate != current) {
+        // Top nibble must follow the ring pattern.
+        if ((current & 0xf000) != expected) {
+            return false;
+        }
+        // Both channels must carry the same lower-12-bit content.
+        // Scan table reports (including button-state-encoded ones) duplicate the
+        // same value verbatim; independent ADC pressure channels will differ.
+        if ((current & 0x0fff) != (duplicate & 0x0fff)) {
             return false;
         }
     }
@@ -1613,6 +1620,11 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
                 dev->pad_baseline[i] = mk1_normalize_pad_word(raw, phase);
             }
             dev->pad_baseline_set = true;
+            fprintf(stderr, "[mk1-usb] pad baseline set (from scan table) phase=%u:", phase);
+            for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
+                fprintf(stderr, " p%u=0x%04x", i, dev->pad_baseline[i]);
+            }
+            fprintf(stderr, "\n");
         }
         log_scan_report(reader, data, len);
         return;
@@ -1628,22 +1640,43 @@ static void mk1_device_dispatch_input_report(mk1_pipe_reader_t *reader,
     if (len == 64) {
         uint8_t phase = mk1_scan_phase(data, len);
 
+        // Pressure reports always have phase=0: pad 0 rests at 0x0000 and max
+        // pressure is 4095 (0x0FFF), so its top nibble is always 0. Any report
+        // with phase != 0 is a scan table that the ring-pattern classifier missed
+        // (e.g., channels A and B had slightly different lower bits so the
+        // duplicate check failed). Discard it here.
+        if (phase != 0) {
+            log_scan_report(reader, data, len);
+            return;
+        }
+
         if (!dev->pad_baseline_set) {
             for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
                 uint16_t raw = read_le16(data + (i * 2));
                 dev->pad_baseline[i] = mk1_normalize_pad_word(raw, phase);
             }
             dev->pad_baseline_set = true;
+            fprintf(stderr, "[mk1-usb] pad baseline set (from pressure report) phase=%u:", phase);
+            for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
+                fprintf(stderr, " p%u=0x%04x", i, dev->pad_baseline[i]);
+            }
+            fprintf(stderr, "\n");
             return;  // skip this first report; it is calibration only
         }
 
         mk1_pad_event_t pads[MK1_PAD_COUNT];
         for (uint8_t i = 0; i < MK1_PAD_COUNT; i++) {
             uint16_t raw    = read_le16(data + (i * 2));
+            uint16_t dup    = read_le16(data + 32 + (i * 2));
             uint16_t norm   = mk1_normalize_pad_word(raw, phase);
             int32_t  delta  = (int32_t)norm - (int32_t)dev->pad_baseline[i];
             pads[i].index    = i;
             pads[i].pressure = (uint16_t)(delta <= 0 ? 0 : (delta > 4095 ? 4095 : delta));
+            if (pads[i].pressure > 300) {
+                fprintf(stderr,
+                        "[mk1-usb] high-pressure pad=%u pressure=%u raw=0x%04x dup=0x%04x norm=0x%04x baseline=0x%04x phase=%u\n",
+                        i, pads[i].pressure, raw, dup, norm, dev->pad_baseline[i], phase);
+            }
         }
 
         if (dev->pad_cb) {

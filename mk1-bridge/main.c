@@ -732,40 +732,117 @@ static void bmp_pack_st7529(uint8_t *fb, uint8_t bmp[64][255])
 static void render_cat_status_fb(uint8_t *fb, int frame)
 {
     static uint8_t bmp[64][255];
-    const uint8_t white = 0x1F;
-    const uint8_t black = 0x00;
+    const uint8_t W = 0x1F;   // white
+    const uint8_t B = 0x00;   // black (space)
+    const uint8_t G = 0x0B;   // grey (tractor beam)
 
-    bmp_fill(bmp, white);
+    bmp_fill(bmp, B);         // space background
 
-    // Idle animation: ball rolls in from the left, cat bats it back.
-    // 120-frame cycle at ~67 ms/frame ≈ 8 s loop.
-    float phase = (float)(frame % 120) / 120.0f * 2.0f * (float)M_PI;
+    // Twinkling stars
+    static const int8_t kStars[][2] = {
+        {18,4},{45,10},{88,2},{135,7},{175,3},{215,12},{245,5},
+        {25,30},{65,22},{155,19},{205,35},{12,40},{108,27},{232,21},
+    };
+    for (int si = 0; si < 14; si++) {
+        if ((frame + si * 7) % 45 < 30)
+            bmp_plot(bmp, (int)kStars[si][0], (int)kStars[si][1], W);
+    }
 
-    // Ball oscillates horizontally between x=42 and x=88 (left of front paw).
-    int ball_x = 65 + (int)(23.0f * sinf(phase));
-    // Ball bounces off the floor twice per cycle.
-    int ball_y = 55 - (int)(3.0f * fabsf(sinf(phase * 2.0f)));
+    // Ground line
+    bmp_fill_rect(bmp, 90, 60, 165, 60, W);
 
-    // Paw raises as the ball swings toward the cat, swipes down as it passes.
-    float raise = sinf(phase);
-    if (raise < 0.0f) raise = 0.0f;
-    int paw_top = 42 + (int)(8.0f * raise);   // 42 (rest) → 50 (raised)
+    // 400-frame cycle at ~67 ms/frame (~26.8 s):
+    //   0.. 79  [A] UFO flies L/R, cat on ground
+    //  80..119  [B] UFO homes in above cat
+    // 120..169  [C] beam fires, cat rises into UFO
+    // 170..249  [D] UFO flies L/R, cat inside
+    // 250..289  [E] UFO homes back above drop point
+    // 290..339  [F] beam fires, cat descends to ground
+    // 340..399  [G] UFO flies L/R, cat on ground
+    int f = frame % 400;
 
-    bmp_fill_ellipse(bmp, 122, 37, 40, 13, black);    // body
-    bmp_fill_ellipse(bmp, 85, 25, 12, 10, black);     // head
-    bmp_fill_triangle(bmp, 77, 18, 82, 7, 87, 18, black); // left ear
-    bmp_fill_triangle(bmp, 84, 18, 89, 6, 95, 19, black); // right ear
-    bmp_fill_rect(bmp, 98, paw_top, 105, 57, black);  // front paw (animated)
-    bmp_fill_rect(bmp, 114, 42, 121, 57, black);      // front leg
-    bmp_fill_rect(bmp, 133, 43, 140, 57, black);      // rear leg
-    bmp_fill_rect(bmp, 147, 42, 154, 57, black);      // rear leg
-    bmp_fill_ellipse(bmp, 83, 34, 8, 4, white);       // neck cut-in
-    bmp_fill_ellipse(bmp, 161, 22, 5, 18, black);     // tail upright
-    bmp_fill_ellipse(bmp, 155, 9, 8, 5, black);       // tail curl tip
-    bmp_fill_ellipse(bmp, 157, 29, 5, 7, black);      // tail base
-    bmp_fill_rect(bmp, 70, 57, 160, 59, black);       // ground shadow line
+    const int CAT_X = 127;
+    const int GND_Y = 60;
+    int cat_lift = 0;
+    bool cat_vis = true;
+    bool beam_active = false;
 
-    bmp_fill_ellipse(bmp, ball_x, ball_y, 4, 4, black); // ball
+    if (f >= 120 && f < 170) {
+        float t = (float)(f - 120) / 50.0f;
+        cat_lift = (int)(t * 40.0f);
+        beam_active = true;
+    } else if (f >= 170 && f < 290) {
+        cat_vis = false;
+    } else if (f >= 290 && f < 340) {
+        float t = (float)(f - 290) / 50.0f;
+        cat_lift = (int)((1.0f - t) * 40.0f);
+        beam_active = true;
+    }
+
+    // UFO position
+    float ufo_xf, ufo_yf = 16.0f;
+    if (f < 80) {
+        // [A] fly L/R
+        ufo_xf = 127.5f + 85.0f * sinf((float)f * 2.0f * (float)M_PI / 40.0f);
+    } else if (f < 120) {
+        // [B] home in
+        float t = (float)(f - 80) / 40.0f;
+        t = t * t * (3.0f - 2.0f * t);
+        float sx = 127.5f + 85.0f * sinf(79.0f * 2.0f * (float)M_PI / 40.0f);
+        ufo_xf = sx + t * (127.5f - sx);
+    } else if (f < 170) {
+        // [C] hover while beaming up
+        ufo_xf = 127.5f;
+    } else if (f < 250) {
+        // [D] fly L/R with cat inside
+        ufo_xf = 127.5f + 85.0f * sinf((float)(f - 170) * 2.0f * (float)M_PI / 40.0f);
+    } else if (f < 290) {
+        // [E] home back to drop point
+        float t = (float)(f - 250) / 40.0f;
+        t = t * t * (3.0f - 2.0f * t);
+        float sx = 127.5f + 85.0f * sinf(79.0f * 2.0f * (float)M_PI / 40.0f);
+        ufo_xf = sx + t * (127.5f - sx);
+    } else if (f < 340) {
+        // [F] hover while beaming down
+        ufo_xf = 127.5f;
+    } else {
+        // [G] fly L/R, cat back on ground
+        ufo_xf = 127.5f + 85.0f * sinf((float)(f - 340) * 2.0f * (float)M_PI / 40.0f);
+    }
+    int ux = (int)ufo_xf;
+    int uy = (int)ufo_yf;
+
+    // Tractor beam
+    if (beam_active) {
+        int bot_y = GND_Y - cat_lift;
+        bmp_fill_triangle(bmp, ux, uy + 5, ux - 20, bot_y, ux + 20, bot_y, G);
+    }
+
+    // Cat: small, standing, centered at CAT_X
+    if (cat_vis) {
+        int cy = GND_Y - cat_lift;   // cat bottom y
+
+        bmp_fill_ellipse(bmp, CAT_X,      cy - 5,  11, 4, W);  // body
+        bmp_fill_ellipse(bmp, CAT_X,      cy - 16,  7, 6, W);  // head
+        bmp_fill_triangle(bmp,                                  // left ear
+            CAT_X - 7, cy - 20, CAT_X - 4, cy - 26, CAT_X, cy - 20, W);
+        bmp_fill_triangle(bmp,                                  // right ear
+            CAT_X, cy - 20, CAT_X + 3, cy - 26, CAT_X + 7, cy - 20, W);
+        bmp_fill_rect(bmp, CAT_X - 9, cy - 3, CAT_X - 6, cy, W);   // left front leg
+        bmp_fill_rect(bmp, CAT_X + 6, cy - 3, CAT_X + 9, cy, W);   // right front leg
+        bmp_fill_ellipse(bmp, CAT_X + 15, cy - 8,  3, 7, W);  // tail upright
+        bmp_fill_ellipse(bmp, CAT_X + 19, cy - 14, 4, 3, W);  // tail curl tip
+        bmp_plot(bmp, CAT_X - 3, cy - 17, B);                 // left eye
+        bmp_plot(bmp, CAT_X + 3, cy - 17, B);                 // right eye
+    }
+
+    // UFO (drawn last, covers cat when it enters saucer)
+    if (uy > -20) {
+        bmp_fill_ellipse(bmp, ux, uy,      22, 5, W);  // saucer disk
+        bmp_fill_ellipse(bmp, ux, uy -  6, 12, 9, W);  // dome
+        bmp_fill_ellipse(bmp, ux, uy -  7,  6, 5, B);  // dome window (black)
+        bmp_fill_ellipse(bmp, ux, uy +  4,  8, 2, G);  // underbelly ridge
+    }
 
     bmp_pack_st7529(fb, bmp);
 }

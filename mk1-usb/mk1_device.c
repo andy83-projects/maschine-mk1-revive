@@ -1043,16 +1043,17 @@ static int8_t mk1_wrapped_u8_delta(uint8_t previous, uint8_t current)
     return (int8_t)delta;
 }
 
-static bool mk1_encoder_value_increased(uint8_t x,
-                                        uint8_t y,
-                                        uint8_t prev_x,
-                                        uint8_t prev_y)
+// Quadrature direction decoder — identical logic to cabl's MaschineMK1::processEncoders().
+// The two encoder bytes form a quadrature (90°-phase) signal pair. Direction cannot be
+// determined from the sign of either byte's delta alone; it depends on which quadrant
+// (x>127, y>127) the encoder currently sits in and how both bytes changed together.
+// In Q1 (x>127) CW motion causes x to DECREASE — using dp>0 as "CW" is wrong there.
+static bool mk1_encoder_value_increased(uint8_t x, uint8_t y, uint8_t prev_x, uint8_t prev_y)
 {
     if (x > 127) {
         return (y > 127) ? (x < prev_x && y >= prev_y)
                          : (x >= prev_x && y >= prev_y);
     }
-
     return (y > 127) ? (x < prev_x && y < prev_y)
                      : (x >= prev_x && y < prev_y);
 }
@@ -1254,55 +1255,79 @@ static void mk1_process_ep1_len33_buttons(mk1_device_t *dev, const uint8_t *data
     int8_t screen4_delta_b = mk1_wrapped_u8_delta(dev->ep1_len33_prev[4], data[4]);
     bool screen4_encoder_motion = (screen4_delta_a != 0 || screen4_delta_b != 0);
 
+    // Minimum absolute delta required to treat a byte change as intentional encoder motion.
+    // Single-count jitter (chosen_abs == 1) is filtered here. Tunable via MK1_ENCODER_MIN_DELTA.
+    static int s_min_delta = -1;
+    if (s_min_delta < 0) {
+        const char *env = getenv("MK1_ENCODER_MIN_DELTA");
+        s_min_delta = (env && env[0]) ? atoi(env) : 2;
+        if (s_min_delta < 1) s_min_delta = 1;
+    }
+
+    // Pass 1: compute chosen_abs for every encoder and find the dominant (largest) delta
+    // in this report. Used for crosstalk suppression in pass 2.
+    int chosen_abs_arr[sizeof(knob_map) / sizeof(knob_map[0])];
+    int8_t delta_primary_arr[sizeof(knob_map) / sizeof(knob_map[0])];
+    int8_t delta_secondary_arr[sizeof(knob_map) / sizeof(knob_map[0])];
+    bool   value_increased_arr[sizeof(knob_map) / sizeof(knob_map[0])];
+    int max_chosen_abs = 0;
+
     for (size_t i = 0; i < sizeof(knob_map) / sizeof(knob_map[0]); i++) {
         uint8_t prev_a = dev->ep1_len33_prev[knob_map[i].byte_a];
         uint8_t curr_a = data[knob_map[i].byte_a];
         uint8_t prev_b = dev->ep1_len33_prev[knob_map[i].byte_b];
         uint8_t curr_b = data[knob_map[i].byte_b];
 
+        chosen_abs_arr[i] = 0;
+
         if (prev_a == 0 && prev_b == 0 && !dev->ep1_len33_prev_valid) {
             continue;
         }
-
-        // Skip encoder if its secondary byte is byte[4] and byte[4] is in button range
-        // *without* accompanying Screen4 motion — in that case the value is button state,
-        // not encoder position.
         if (knob_map[i].byte_b == 4 && b4_is_button && !screen4_encoder_motion) {
             continue;
         }
 
-        int8_t delta_primary = mk1_wrapped_u8_delta(prev_a, curr_a);
-        int8_t delta_secondary = mk1_wrapped_u8_delta(prev_b, curr_b);
-        bool value_increased = mk1_encoder_value_increased(curr_a, curr_b, prev_a, prev_b);
-        int dominant_abs = delta_primary < 0 ? -delta_primary : delta_primary;
-        int abs_secondary = delta_secondary < 0 ? -delta_secondary : delta_secondary;
-        int chosen_abs = dominant_abs;
+        int8_t dp = mk1_wrapped_u8_delta(prev_a, curr_a);
+        int8_t ds = mk1_wrapped_u8_delta(prev_b, curr_b);
+        int abs_p = dp < 0 ? -dp : dp;
+        int abs_s = ds < 0 ? -ds : ds;
+        int ca = abs_p > abs_s ? abs_p : abs_s;
 
-        if (abs_secondary > chosen_abs) {
-            chosen_abs = abs_secondary;
+        delta_primary_arr[i]   = dp;
+        delta_secondary_arr[i] = ds;
+        value_increased_arr[i] = mk1_encoder_value_increased(curr_a, curr_b, prev_a, prev_b);
+        chosen_abs_arr[i]      = ca;
+
+        if (ca > max_chosen_abs) max_chosen_abs = ca;
+    }
+
+    // Pass 2: emit events, suppressing encoders with trivially small deltas or clear
+    // crosstalk from a dominant neighbour.
+    for (size_t i = 0; i < sizeof(knob_map) / sizeof(knob_map[0]); i++) {
+        int ca = chosen_abs_arr[i];
+        if (ca == 0) continue;
+        // Require minimum absolute delta to suppress single-count jitter.
+        if (ca < s_min_delta) continue;
+        // Suppress if a clearly dominant encoder moved >= 2× this one (crosstalk).
+        if (max_chosen_abs >= 2 * ca) continue;
+
+        // Direction from quadrature state — same logic as cabl MaschineMK1::processEncoders().
+        bool increasing = value_increased_arr[i];
+        int8_t chosen_delta = (int8_t)(increasing ? ca : -ca);
+        float normalized = (float)chosen_delta / 255.0f * g_encoder_sensitivity;
+
+        if (g_encoder_log_path[0]) {
+            mk1_write_capped_log(g_encoder_log_path,
+                                 "[mk1-usb] knob %s delta_a=%d delta_b=%d dir=%s chosen=%d normalized=%.4f (sens=%.2f)",
+                                 knob_map[i].name,
+                                 (int)delta_primary_arr[i],
+                                 (int)delta_secondary_arr[i],
+                                 increasing ? "inc" : "dec",
+                                 (int)chosen_delta,
+                                 (double)normalized,
+                                 (double)g_encoder_sensitivity);
         }
-
-        if (chosen_abs == 0) {
-            continue;
-        }
-
-        int8_t chosen_delta = (int8_t)(value_increased ? chosen_abs : -chosen_abs);
-
-        if (chosen_delta != 0) {
-            float normalized = (float)chosen_delta / 255.0f * g_encoder_sensitivity;
-            if (g_encoder_log_path[0]) {
-                mk1_write_capped_log(g_encoder_log_path,
-                                     "[mk1-usb] knob %s delta_a=%d delta_b=%d dir=%s chosen=%d normalized=%.4f (sens=%.2f)",
-                                     knob_map[i].name,
-                                     (int)delta_primary,
-                                     (int)delta_secondary,
-                                     value_increased ? "inc" : "dec",
-                                     (int)chosen_delta,
-                                     (double)normalized,
-                                     (double)g_encoder_sensitivity);
-            }
-            mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
-        }
+        mk1_emit_knob_event(dev, knob_map[i].name, knob_map[i].encoder_index, normalized);
     }
 
     // Always update prev before the button early-returns so Screen4 encoder has a fresh

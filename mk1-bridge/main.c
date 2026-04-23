@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <limits.h>
 #include <time.h>
+#include <math.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -564,6 +565,8 @@ static uint16_t g_display_byte_x_start[DISPLAY_COUNT] = {0};
 static uint16_t g_display_byte_x_end[DISPLAY_COUNT] = {0};
 static bool g_display_have_region[DISPLAY_COUNT] = {0};
 static dispatch_source_t g_display_flush_timer = NULL;
+static dispatch_source_t g_cat_anim_timer      = NULL;
+static int               g_cat_anim_frame      = 0;
 static dispatch_queue_t g_display_flush_queue = NULL;
 static bool g_display_flush_active = false;
 static pthread_mutex_t g_display_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -726,7 +729,7 @@ static void bmp_pack_st7529(uint8_t *fb, uint8_t bmp[64][255])
     }
 }
 
-static void render_cat_status_fb(uint8_t *fb)
+static void render_cat_status_fb(uint8_t *fb, int frame)
 {
     static uint8_t bmp[64][255];
     const uint8_t white = 0x1F;
@@ -734,12 +737,25 @@ static void render_cat_status_fb(uint8_t *fb)
 
     bmp_fill(bmp, white);
 
-    // Simple centered cat silhouette with upright tail.
+    // Idle animation: ball rolls in from the left, cat bats it back.
+    // 120-frame cycle at ~67 ms/frame ≈ 8 s loop.
+    float phase = (float)(frame % 120) / 120.0f * 2.0f * (float)M_PI;
+
+    // Ball oscillates horizontally between x=42 and x=88 (left of front paw).
+    int ball_x = 65 + (int)(23.0f * sinf(phase));
+    // Ball bounces off the floor twice per cycle.
+    int ball_y = 55 - (int)(3.0f * fabsf(sinf(phase * 2.0f)));
+
+    // Paw raises as the ball swings toward the cat, swipes down as it passes.
+    float raise = sinf(phase);
+    if (raise < 0.0f) raise = 0.0f;
+    int paw_top = 42 + (int)(8.0f * raise);   // 42 (rest) → 50 (raised)
+
     bmp_fill_ellipse(bmp, 122, 37, 40, 13, black);    // body
     bmp_fill_ellipse(bmp, 85, 25, 12, 10, black);     // head
     bmp_fill_triangle(bmp, 77, 18, 82, 7, 87, 18, black); // left ear
     bmp_fill_triangle(bmp, 84, 18, 89, 6, 95, 19, black); // right ear
-    bmp_fill_rect(bmp, 98, 42, 105, 57, black);       // front leg
+    bmp_fill_rect(bmp, 98, paw_top, 105, 57, black);  // front paw (animated)
     bmp_fill_rect(bmp, 114, 42, 121, 57, black);      // front leg
     bmp_fill_rect(bmp, 133, 43, 140, 57, black);      // rear leg
     bmp_fill_rect(bmp, 147, 42, 154, 57, black);      // rear leg
@@ -748,6 +764,8 @@ static void render_cat_status_fb(uint8_t *fb)
     bmp_fill_ellipse(bmp, 155, 9, 8, 5, black);       // tail curl tip
     bmp_fill_ellipse(bmp, 157, 29, 5, 7, black);      // tail base
     bmp_fill_rect(bmp, 70, 57, 160, 59, black);       // ground shadow line
+
+    bmp_fill_ellipse(bmp, ball_x, ball_y, 4, 4, black); // ball
 
     bmp_pack_st7529(fb, bmp);
 }
@@ -1064,6 +1082,43 @@ static void start_display_flush_timer(bridge_t *br)
     dispatch_resume(g_display_flush_timer);
 }
 
+static void stop_cat_animation(void)
+{
+    if (g_cat_anim_timer) {
+        BLOG("cat anim: stopping");
+        dispatch_source_cancel(g_cat_anim_timer);
+        g_cat_anim_timer = NULL;
+    }
+}
+
+static void start_cat_animation(bridge_t *br)
+{
+    stop_cat_animation();
+    g_cat_anim_frame = 0;
+
+    g_cat_anim_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                              dispatch_get_main_queue());
+    if (!g_cat_anim_timer) return;
+
+    BLOG("cat anim: starting");
+    dispatch_source_set_timer(g_cat_anim_timer,
+                              dispatch_time(DISPATCH_TIME_NOW, 67 * NSEC_PER_MSEC),
+                              67 * NSEC_PER_MSEC,
+                              1  * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_cat_anim_timer, ^{
+        if (!g_running || !br->usb) {
+            BLOG("cat anim: tick skipped (running=%d usb=%p)", g_running, (void *)br->usb);
+            return;
+        }
+        int frame = g_cat_anim_frame++;
+        if (frame % 30 == 0) BLOG("cat anim: frame %d", frame);
+        uint8_t left_fb[DISPLAY_FB_BYTES];
+        render_cat_status_fb(left_fb, frame);
+        send_fb_to_display(br, 0x00, left_fb);
+    });
+    dispatch_resume(g_cat_anim_timer);
+}
+
 // Render and send the disconnected status screens.
 static void show_status_screen(bridge_t *br)
 {
@@ -1071,16 +1126,19 @@ static void show_status_screen(bridge_t *br)
     uint8_t left_fb[DISPLAY_FB_BYTES];
     uint8_t right_fb[DISPLAY_FB_BYTES];
 
-    render_cat_status_fb(left_fb);
+    render_cat_status_fb(left_fb, 0);
     render_status_fb(right_fb, "Open Maschine", "Software", true);
 
     send_fb_to_display(br, 0x00, left_fb);
     send_fb_to_display(br, 0x02, right_fb);
+    start_cat_animation(br);
     DLOG("status screen shown");
 }
 
 static void forward_display(bridge_t *br, const uint8_t *raw_msg, size_t raw_len)
 {
+    stop_cat_animation();
+
     uint64_t start_ns = timing_now_ns();
 
     if (!br->usb) {
@@ -1876,12 +1934,18 @@ static int      g_pad_pressure_threshold = 200;   // MK1_PAD_PRESSURE
 static int      g_pad_hit_on_threshold   = 300;   // MK1_PAD_HIT_ON
 static int      g_pad_hit_off_threshold  = 150;   // MK1_PAD_HIT_OFF
 static uint64_t g_pad_debounce_ns        = 10000000ULL; // MK1_PAD_DEBOUNCE_MS (ms → ns)
+// Minimum consecutive EP4 reports above hit_on threshold before firing hit_on.
+// One-report spikes (pressure=302 then drops) are mechanical bounce, not real hits.
+// At ~700 Hz that means ~3 reports ≈ 4 ms sustain required. Override: MK1_PAD_SUSTAIN.
+static int      g_pad_sustain_count      = 3;     // MK1_PAD_SUSTAIN
 
 static uint16_t g_prev_pressure[16]      = {0};  // for hit_on/hit_off transitions
 static uint16_t g_sent_pressure[16]      = {0};  // last pressure value forwarded via IPC
 static uint64_t g_hit_off_time_ns[16]    = {0};  // timestamp of last hit_off per pad
+static bool     g_pending_hit_off[16]    = {0};  // hit_off send failed; retry on next report
+static int      g_above_threshold[16]    = {0};  // consecutive reports above hit_on threshold
 
-static void send_pad_record(mk1_server_t *srv,
+static bool send_pad_record(mk1_server_t *srv,
                              uint64_t ts_ns,
                              uint32_t pad_index,
                              uint32_t event_type,
@@ -1911,6 +1975,7 @@ static void send_pad_record(mk1_server_t *srv,
          (unsigned long long)((timing_now_ns() - start_ns) / 1000ULL),
          (double)value,
          (unsigned long long)ts_ns);
+    return ok;
 }
 
 static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
@@ -1921,6 +1986,14 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
     struct timespec ts;
     clock_gettime(CLOCK_UPTIME_RAW, &ts);
     uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+    // Retry any hit_offs that failed to send on a previous report.
+    for (uint8_t i = 0; i < 16; i++) {
+        if (g_pending_hit_off[i]) {
+            if (send_pad_record(br->srv, ts_ns, i, PAD_EVT_HIT_OFF, 0.0f))
+                g_pending_hit_off[i] = false;
+        }
+    }
 
     for (uint8_t i = 0; i < count && i < 16; i++) {
         uint32_t idx      = pads[i].index;    // EP4 pair == IPC pad_index (confirmed)
@@ -1934,13 +2007,32 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
         bool     is_active =
             pressure >= (uint16_t)(was_active ? g_pad_hit_off_threshold : g_pad_hit_on_threshold);
 
-        if (pressure == prev) continue;
+        // Only skip identical pressure if no state transition would occur.
+        // Applying this gate unconditionally can prevent hit_on from firing after
+        // a debounce suppression updated g_prev_pressure without sending hit_on.
+        if (pressure == prev && (was_active == is_active)) continue;
+
+        // Reset sustain counter if pressure dropped back below hit_on threshold
+        // without us having sent hit_on (i.e., a bounce spike that subsided).
+        if (!was_active && !is_active) {
+            g_above_threshold[idx] = 0;
+        }
 
         float value = is_active ? (pressure / PAD_PRESSURE_MAX) : 0.0f;
 
         if (!was_active && is_active) {
             // Debounce: suppress hit_on if we just released this pad within the window.
             if (ts_ns - g_hit_off_time_ns[idx] < g_pad_debounce_ns) {
+                g_prev_pressure[idx] = pressure;
+                g_led_pad_pressure[idx] = pressure;
+                g_above_threshold[idx] = 0;
+                continue;
+            }
+            // Sustain gate: require pressure to stay above hit_on threshold for
+            // g_pad_sustain_count consecutive reports before firing hit_on.
+            // This filters single-report mechanical bounce spikes.
+            g_above_threshold[idx]++;
+            if (g_above_threshold[idx] < g_pad_sustain_count) {
                 g_prev_pressure[idx] = pressure;
                 g_led_pad_pressure[idx] = pressure;
                 continue;
@@ -1957,15 +2049,20 @@ static void on_pad(const mk1_pad_event_t *pads, uint8_t count, void *ctx)
                 BTNLOG("pad idx=%u hit_on pressure=%u (%.3f) snapshot:%s",
                        idx, pressure, (double)value, snap);
             }
-            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON,         value);
-            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
-            g_sent_pressure[idx] = pressure;
+            bool ok = send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_ON, value);
+            if (ok) {
+                send_pad_record(br->srv, ts_ns, idx, PAD_EVT_PRESSURE_UPDATE, value);
+                g_sent_pressure[idx] = pressure;
+            }
+            // If hit_on failed, leave g_sent_pressure=0 so we retry on the next report.
         } else if (was_active && !is_active) {
             // pad released
             BTNLOG("pad idx=%u hit_off", idx);
-            send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_OFF, 0.0f);
+            bool ok = send_pad_record(br->srv, ts_ns, idx, PAD_EVT_HIT_OFF, 0.0f);
             g_sent_pressure[idx] = 0;
             g_hit_off_time_ns[idx] = ts_ns;
+            g_pending_hit_off[idx] = !ok;  // retry on next report if send failed
+            g_above_threshold[idx] = 0;
         } else if (is_active) {
             // pad held — only forward if pressure changed enough to be meaningful
             uint16_t sent = g_sent_pressure[idx];
@@ -3232,6 +3329,7 @@ int main(int argc, char **argv)
     g_pad_hit_off_threshold  = env_int_or_default("MK1_PAD_HIT_OFF",       150);
     g_pad_pressure_threshold = env_int_or_default("MK1_PAD_PRESSURE",      200);
     g_pad_debounce_ns = (uint64_t)env_int_or_default("MK1_PAD_DEBOUNCE_MS", 10) * 1000000ULL;
+    g_pad_sustain_count = env_int_or_default("MK1_PAD_SUSTAIN", 3);
     g_display_tick_ms = env_int_or_default("MK1_DISPLAY_TICK_MS", 16);
     if (g_display_tick_ms <= 0) g_display_tick_ms = 16;
     g_display_partial_flush = true;
@@ -3336,6 +3434,7 @@ int main(int argc, char **argv)
         dispatch_source_cancel(g_display_flush_timer);
         g_display_flush_timer = NULL;
     }
+    stop_cat_animation();
     mk1_hotplug_stop(g_bridge.hotplug);
     if (g_bridge.srv) {
         mk1_server_stop(g_bridge.srv);

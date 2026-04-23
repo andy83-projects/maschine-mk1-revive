@@ -30,16 +30,19 @@ Entirely userspace. No DriverKit, no kernel code, no special entitlements.
 registers the `NIHWMainHandler` CFMessagePort itself. It owns both ends: full IPC
 handshake with the Maschine app and direct IOKit USB bulk transfers to the hardware.
 
-Working as of 2026-04-20:
+Working as of 2026-04-23:
 - Maschine software detects the MK1 in its controller list
 - Both displays render correctly (ST7529, EP8 bulk, 170×64 grayscale)
 - Status screen ("Open Maschine") shown on both displays at bridge start and when Maschine exits
 - All button and transport LEDs confirmed working: pad-row (Scene/Mute/Solo/Select/Duplicate/Navigate/Pad Mode/Pattern), transport (Play/Record/Restart/Erase/Grid/Shift/TransportLeft/TransportRight), screen area (SA1–SA8), Browse, Note Repeat, Snap, Control, Step, Modules Left/Right, Auto Write, Group A–H
 - Pad rubber LEDs light correctly per active group and pad hits
 - Pads register velocity and pressure (EP4 64-byte reports, 12-bit ADC, IPC forwarded)
+  - Sustain gate: requires 3 consecutive above-threshold reports before firing hit_on, eliminating stuck-note bouncing
   - Pressure updates throttled to ≥5% change threshold to prevent IPC flooding at 700Hz
 - Group, transport, and screen buttons registered (EP1 short reports)
 - All 11 encoders forwarded: Volume, Tempo, Swing (Master Section) + 8 screen area encoders
+  - Correct quadrature direction decoding (matches cabl reference implementation)
+  - Single-count jitter filtered; electrical crosstalk between adjacent encoders suppressed
 - USB hot-plug: bridge can start before device is connected; device can be unplugged and re-plugged
 - Physical DIN MIDI Out transport: basic CoreMIDI-to-DIN path working
 - Physical DIN MIDI In transport: not yet hardware-verified
@@ -169,6 +172,14 @@ or by setting environment variables in the launchd plist's `EnvironmentVariables
 | `MK1_PAD_HIT_OFF` | `150` | ADC pressure must fall below this to register release (hysteresis) |
 | `MK1_PAD_PRESSURE` | `200` | Minimum change to forward a pressure-update event (reduces 700Hz flooding) |
 | `MK1_PAD_DEBOUNCE_MS` | `10` | Milliseconds between hit-off and next hit-on (prevents rubber bounce) |
+| `MK1_PAD_SUSTAIN` | `3` | Consecutive above-threshold reports required before firing hit_on (prevents bounce-triggered stuck notes) |
+
+### Encoder
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MK1_ENCODER_SENSITIVITY` | `10` | Encoder step multiplier in tenths (10 = ×1.0, 5 = ×0.5, 20 = ×2.0) |
+| `MK1_ENCODER_MIN_DELTA` | `2` | Minimum absolute byte-delta per report to register an encoder step (filters single-count jitter) |
 
 ### Display
 
@@ -310,6 +321,32 @@ Recommended workflow:
 6. For direct physical probing, `MK1_LED_PROBE=1` supports `phys[0..32]`.
 
 ## Changelog
+
+### v0.3.2 — 2026-04-23
+
+#### Pad input reliability
+- **Fix stuck notes from bouncing pads** — pads near the hit-on threshold (e.g. resting pressure
+  302–337) flooded the IPC pipeline with rapid hit_on/hit_off cycles, leaving notes stuck on.
+  Added a sustain gate: `MK1_PAD_SUSTAIN` (default 3) consecutive above-threshold reports are
+  required before `hit_on` fires. One or two counts of mechanical bounce are absorbed silently.
+- **Reliable hit_off delivery** — `send_pad_record` now returns success/failure. If a hit_off IPC
+  send fails (25ms CFMessagePort timeout), the event is retried at the top of the next EP4 report
+  callback before processing new pressure data.
+- **hit_on conditional on IPC success** — `g_sent_pressure` is only set if the hit_on send
+  actually succeeded, preventing orphaned active-pad state on IPC backpressure.
+
+#### Encoder reliability
+- **Fix direction reversal** — restored correct quadrature direction decoder (`mk1_encoder_value_increased`),
+  identical to the reference implementation in `cabl/MaschineMK1::processEncoders()`. The encoder
+  byte pair is a quadrature signal: in the high-x quadrant (x > 127), CW rotation causes the
+  primary byte to *decrease*, so using `delta > 0` as the CW indicator was wrong in that half
+  of the cycle. The quadrature state check is the correct decoder.
+- **Filter single-count jitter** — `MK1_ENCODER_MIN_DELTA` (default 2) requires a minimum
+  absolute byte delta before an encoder step is emitted. Eliminates resting-encoder IPC noise.
+- **Suppress electrical crosstalk** — two-pass processing computes all encoder deltas before
+  emitting any. An encoder whose delta is ≤ half the dominant encoder's delta in the same
+  report is suppressed as electrical coupling noise (2:1 ratio). Genuine simultaneous encoder
+  use is preserved when both move at comparable magnitude.
 
 ### v0.3.1 — 2026-04-20
 - **Fix rogue pad hits** — EP4 scan table reports at non-zero ring phase (phases 1–15) were

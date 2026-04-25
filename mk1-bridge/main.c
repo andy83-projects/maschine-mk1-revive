@@ -734,7 +734,6 @@ static void render_cat_status_fb(uint8_t *fb, int frame)
     static uint8_t bmp[64][255];
     const uint8_t W = 0x1F;   // white
     const uint8_t B = 0x00;   // black (space)
-    const uint8_t G = 0x0B;   // grey (tractor beam)
 
     bmp_fill(bmp, B);         // space background
 
@@ -812,10 +811,18 @@ static void render_cat_status_fb(uint8_t *fb, int frame)
     int ux = (int)ufo_xf;
     int uy = (int)ufo_yf;
 
-    // Tractor beam
+    // Tractor beam — alternating white scanlines, widening from UFO down to cat.
+    // Striped so the solid-white cat remains distinguishable inside the beam.
     if (beam_active) {
-        int bot_y = GND_Y - cat_lift;
-        bmp_fill_triangle(bmp, ux, uy + 5, ux - 20, bot_y, ux + 20, bot_y, G);
+        int bot_y  = GND_Y - cat_lift;
+        int top_y  = uy + 5;
+        int height = bot_y - top_y;
+        if (height > 0) {
+            for (int by = top_y; by <= bot_y; by += 2) {
+                int hw = (int)(20.0f * (float)(by - top_y) / (float)height);
+                bmp_fill_rect(bmp, ux - hw, by, ux + hw, by, W);
+            }
+        }
     }
 
     // Cat: small, standing, centered at CAT_X
@@ -841,7 +848,7 @@ static void render_cat_status_fb(uint8_t *fb, int frame)
         bmp_fill_ellipse(bmp, ux, uy,      22, 5, W);  // saucer disk
         bmp_fill_ellipse(bmp, ux, uy -  6, 12, 9, W);  // dome
         bmp_fill_ellipse(bmp, ux, uy -  7,  6, 5, B);  // dome window (black)
-        bmp_fill_ellipse(bmp, ux, uy +  4,  8, 2, G);  // underbelly ridge
+        bmp_fill_ellipse(bmp, ux, uy +  4,  8, 2, B);  // underbelly ridge (dark)
     }
 
     bmp_pack_st7529(fb, bmp);

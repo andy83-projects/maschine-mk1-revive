@@ -24,6 +24,7 @@ fi
 pkill -x mk1-menubar >/dev/null 2>&1 || true
 
 rm -rf "${APP_PATH}"
+rm -f /usr/local/bin/mk1-bridge
 
 pkgutil --forget com.dragco.mk1-bridge >/dev/null 2>&1 || true
 

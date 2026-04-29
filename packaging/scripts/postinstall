@@ -4,6 +4,9 @@ set -eu
 SYSTEM_PLIST="/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
 LABEL="com.dragco.mk1-bridge"
 
+# Remove legacy binary location from versions prior to v0.3.4.
+rm -f /usr/local/bin/mk1-bridge
+
 console_user="$(stat -f %Su /dev/console 2>/dev/null || true)"
 if [ -z "${console_user}" ] || [ "${console_user}" = "root" ] || [ "${console_user}" = "loginwindow" ]; then
     exit 0

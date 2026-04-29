@@ -18,35 +18,26 @@ Userspace driver for the Native Instruments Maschine MK1 on Apple Silicon macOS 
 
 ## Install
 
-Download the latest `.pkg` from [Releases](https://github.com/andy83-projects/maschine-mk1-revive/releases). The installer places:
+Download `maschine-mk1-revive-vX.X.X-macos.zip` from [Releases](https://github.com/andy83-projects/maschine-mk1-revive/releases), unzip, and drag **MK1 Revive** to `/Applications`.
 
-- **MK1 Revive** app (includes `mk1-bridge`) → `/Applications/MK1 Revive.app`
-- LaunchAgent → `~/Library/LaunchAgents/com.dragco.mk1-bridge.plist`
+Launch **MK1 Revive** — on first launch it automatically installs the LaunchAgent and starts the bridge.
 
-The bridge starts automatically. Open **MK1 Revive** from `/Applications` to manage the service and adjust settings.
+### If macOS blocks the app
 
-### Unsigned package
-
-macOS may warn that the package is from an unidentified developer.
-
-- **Blocked at install:** right-click the `.pkg` → Open, or go to `System Settings → Privacy & Security` and allow it.
-- **Quarantined binary after install:** clear quarantine and restart the agent:
+Right-click → Open, or go to `System Settings → Privacy & Security` and allow it. If the app is quarantined after unzipping:
 
 ```bash
-sudo xattr -dr com.apple.quarantine "/Applications/MK1 Revive.app"
-launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.dragco.mk1-bridge.plist 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.dragco.mk1-bridge.plist
+xattr -dr com.apple.quarantine "/Applications/MK1 Revive.app"
 ```
 
-### Uninstall
+Then launch the app normally.
 
-Run the matching uninstaller package, or manually:
+### Uninstall
 
 ```bash
 launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.dragco.mk1-bridge.plist 2>/dev/null || true
 rm -f ~/Library/LaunchAgents/com.dragco.mk1-bridge.plist
 sudo rm -rf "/Applications/MK1 Revive.app"
-sudo pkgutil --forget com.dragco.mk1-bridge
 ```
 
 ## Configuration

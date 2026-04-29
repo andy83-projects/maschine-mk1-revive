@@ -136,6 +136,33 @@ func setLoginItem(_ enable: Bool) {
     }
 }
 
+/// On first launch (no plist exists anywhere), write a LaunchAgent plist that
+/// points to the bridge binary inside this app bundle, then bootstrap the service.
+/// Using Bundle.main.bundlePath means this works wherever the app is installed.
+func setupLaunchAgentIfNeeded() {
+    let fm = FileManager.default
+    guard !fm.fileExists(atPath: kUserPlist),
+          !fm.fileExists(atPath: kSystemPlist) else { return }
+
+    let bridgePath = Bundle.main.bundlePath + "/Contents/MacOS/mk1-bridge"
+    guard fm.fileExists(atPath: bridgePath) else { return }
+
+    let plist: [String: Any] = [
+        "Label":           kLabel,
+        "ProgramArguments": [bridgePath],
+        "RunAtLoad":       true,
+        "KeepAlive":       true,
+    ]
+    guard let data = try? PropertyListSerialization.data(
+        fromPropertyList: plist, format: .xml, options: 0) else { return }
+
+    let agentsDir = NSHomeDirectory() + "/Library/LaunchAgents"
+    try? fm.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
+    guard (try? data.write(to: URL(fileURLWithPath: kUserPlist))) != nil else { return }
+
+    shell("bootstrap", kUIDDomain, kUserPlist)
+}
+
 func startService() {
     if serviceIsLoaded() {
         shell("start", kLabel)
@@ -654,6 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // LSUIElement=true in Info.plist handles accessory mode — no setActivationPolicy needed
         migrateToUserPlistIfNeeded()
+        setupLaunchAgentIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             if let image = makeMenuBarIcon() {

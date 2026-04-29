@@ -8,8 +8,6 @@ REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 CONFIGURATION="${CONFIGURATION:-Debug}"
 PKG_VERSION="${PKG_VERSION:-0.1.0}"
-BUILD_DIR="${REPO_ROOT}/build/${CONFIGURATION}"
-BINARY_PATH="${BUILD_DIR}/mk1-bridge"
 PLIST_SOURCE="${REPO_ROOT}/mk1-bridge/com.dragco.mk1-bridge.plist"
 PKG_ID="com.dragco.mk1-bridge"
 OUT_DIR="${REPO_ROOT}/dist"
@@ -22,12 +20,10 @@ xcodebuild -project "${REPO_ROOT}/maschine-mk1-revive.xcodeproj" \
     -configuration "${CONFIGURATION}" \
     build
 
-bash "${REPO_ROOT}/mk1-menubar/build.sh"
+CONFIGURATION="${CONFIGURATION}" bash "${REPO_ROOT}/mk1-menubar/build.sh"
 
-install -d "${STAGE_ROOT}/usr/local/bin"
 install -d "${STAGE_ROOT}/Library/LaunchAgents"
 install -d "${STAGE_ROOT}/Applications"
-install -m 755 "${BINARY_PATH}" "${STAGE_ROOT}/usr/local/bin/mk1-bridge"
 install -m 644 "${PLIST_SOURCE}" "${STAGE_ROOT}/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
 cp -r "${REPO_ROOT}/build/MK1 Revive.app" "${STAGE_ROOT}/Applications/MK1 Revive.app"
 xattr -cr "${STAGE_ROOT}"

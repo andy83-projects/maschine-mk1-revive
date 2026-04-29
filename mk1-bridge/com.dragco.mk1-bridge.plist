@@ -10,7 +10,7 @@
     <!-- Path to our built daemon -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/mk1-bridge</string>
+        <string>/Applications/MK1 Revive.app/Contents/MacOS/mk1-bridge</string>
     </array>
 
     <!-- Start at login -->

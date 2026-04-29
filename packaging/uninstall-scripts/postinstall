@@ -1,26 +1,28 @@
 #!/bin/sh
 set -eu
 
-BINARY_PATH="/usr/local/bin/mk1-bridge"
-PLIST_PATH="/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
 LABEL="com.dragco.mk1-bridge"
-
 APP_PATH="/Applications/MK1 Revive.app"
 
 console_user="$(stat -f %Su /dev/console 2>/dev/null || true)"
 if [ -n "${console_user}" ] && [ "${console_user}" != "root" ] && [ "${console_user}" != "loginwindow" ]; then
     console_uid="$(id -u "${console_user}" 2>/dev/null || true)"
     if [ -n "${console_uid}" ]; then
-        launchctl bootout "gui/${console_uid}" "${PLIST_PATH}" >/dev/null 2>&1 || \
+        # Plist lives in the user's LaunchAgents folder (moved there by postinstall).
+        user_home="$(dscl . -read "/Users/${console_user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+        if [ -z "${user_home}" ]; then
+            user_home="$(eval echo "~${console_user}")"
+        fi
+        USER_PLIST="${user_home}/Library/LaunchAgents/com.dragco.mk1-bridge.plist"
+        launchctl bootout "gui/${console_uid}" "${USER_PLIST}" >/dev/null 2>&1 || \
         launchctl bootout "gui/${console_uid}/${LABEL}" >/dev/null 2>&1 || true
+        rm -f "${USER_PLIST}"
     fi
 fi
 
 # Quit the menu bar app if running
 pkill -x mk1-menubar >/dev/null 2>&1 || true
 
-rm -f "${PLIST_PATH}"
-rm -f "${BINARY_PATH}"
 rm -rf "${APP_PATH}"
 
 pkgutil --forget com.dragco.mk1-bridge >/dev/null 2>&1 || true
